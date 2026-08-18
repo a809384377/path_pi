@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams, type SpawnOptionsWithoutStdio } from "node:child_process";
+import { execFileSync, spawn, type ChildProcessWithoutNullStreams, type SpawnOptionsWithoutStdio } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { JsonlDecoder } from "./jsonl.js";
 import {
@@ -49,17 +49,82 @@ interface PendingCommand {
 const defaultProcessFactory: ProcessFactory = (command, args, options) =>
   spawn(command, args, { ...options, stdio: ["pipe", "pipe", "pipe"] }) as ChildProcessWithoutNullStreams;
 
+class PosixProcessGroup {
+  readonly #pgid: number;
+  #released = false;
+  #leaderExited = false;
+
+  constructor(pgid: number) {
+    this.#pgid = pgid;
+  }
+
+  get id(): number {
+    return this.#pgid;
+  }
+
+  markLeaderExited(): void {
+    this.#leaderExited = true;
+  }
+
+  alive(): boolean {
+    if (this.#released) return false;
+    try {
+      const members = execFileSync("ps", ["-o", "pid=,stat=", "-g", String(this.#pgid)], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      })
+        .split("\n")
+        .map((line) => line.trim().match(/^(\d+)\s+(\S+)/))
+        .filter((member): member is RegExpMatchArray => member !== null)
+        .map((member) => ({ pid: Number(member[1]), state: member[2]! }));
+      const liveMembers = members.filter((member) => !member.state.startsWith("Z"));
+      if (this.#leaderExited && liveMembers.some((member) => member.pid === this.#pgid)) {
+        this.#released = true;
+        return false;
+      }
+      if (liveMembers.length > 0) return true;
+      this.#released = true;
+      return false;
+    } catch {
+      try {
+        process.kill(-this.#pgid, 0);
+        return true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EPERM") return true;
+        this.#released = true;
+        return false;
+      }
+    }
+  }
+
+  signal(signal: NodeJS.Signals): boolean {
+    if (!this.alive()) return false;
+    try {
+      process.kill(-this.#pgid, signal);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") this.#released = true;
+      return false;
+    }
+  }
+
+  release(): void {
+    this.#released = true;
+  }
+}
+
 export class PiRpcProcess extends EventEmitter {
   readonly #options: Required<Pick<PiRpcProcessOptions, "executable" | "commandTimeoutMs" | "shutdownGraceMs" | "maxStderrBytes">> &
     PiRpcProcessOptions;
   readonly #pending = new Map<string, PendingCommand>();
   readonly #decoder = new JsonlDecoder();
   #child: SpawnedProcess | undefined;
+  #processGroup: PosixProcessGroup | undefined;
   #requestSequence = 0;
   #acceptingCommands = false;
   #stderr = "";
-  #exitPromise: Promise<void> | undefined;
-  #resolveExit: (() => void) | undefined;
+  #ownershipPromise: Promise<void> | undefined;
+  #resolveOwnership: (() => void) | undefined;
   #terminationReason: Error | undefined;
   #terminationStarted: Promise<void> | undefined;
   #exitNotified = false;
@@ -80,11 +145,11 @@ export class PiRpcProcess extends EventEmitter {
   }
 
   get processOwned(): boolean {
-    return this.#child !== undefined;
+    return this.#processGroup?.alive() ?? this.#child !== undefined;
   }
 
   get pid(): number | undefined {
-    return this.#child?.pid;
+    return this.#processGroup?.id ?? this.#child?.pid;
   }
 
   get stderrTail(): string {
@@ -92,7 +157,7 @@ export class PiRpcProcess extends EventEmitter {
   }
 
   async start(): Promise<PiSessionState> {
-    if (this.#child !== undefined) throw new Error("Pi RPC process has already been started");
+    if (this.processOwned) throw new Error("Pi RPC process has already been started");
     this.#acceptingCommands = true;
     this.#terminationReason = undefined;
     this.#terminationStarted = undefined;
@@ -107,8 +172,9 @@ export class PiRpcProcess extends EventEmitter {
       detached: process.platform !== "win32",
     });
     this.#child = child;
-    this.#exitPromise = new Promise((resolve) => {
-      this.#resolveExit = resolve;
+    if (process.platform !== "win32" && child.pid !== undefined) this.#processGroup = new PosixProcessGroup(child.pid);
+    this.#ownershipPromise = new Promise((resolve) => {
+      this.#resolveOwnership = resolve;
     });
 
     child.stdout.on("data", (chunk: Buffer | string) => this.#consumeLines(this.#decoder.push(chunk)));
@@ -119,12 +185,12 @@ export class PiRpcProcess extends EventEmitter {
     child.stderr.on("data", (chunk: Buffer | string) => this.#captureStderr(chunk));
     child.stdin.on("error", (error: Error) => this.#transportFailure(error));
     child.once("error", (error) => this.#transportFailure(error));
-    const confirmProcessExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+    const confirmLeaderExit = (code: number | null, signal: NodeJS.Signals | null): void => {
       const detail = signal ? `signal ${signal}` : `code ${code ?? "unknown"}`;
-      this.#confirmExit(this.#terminationReason ?? new Error(`Pi RPC process exited with ${detail}`));
+      this.#leaderExited(child, this.#terminationReason ?? new Error(`Pi RPC process exited with ${detail}`));
     };
-    child.once("exit", confirmProcessExit);
-    child.once("close", confirmProcessExit);
+    child.once("exit", confirmLeaderExit);
+    child.once("close", confirmLeaderExit);
 
     try {
       return await this.getState();
@@ -155,7 +221,10 @@ export class PiRpcProcess extends EventEmitter {
   }
 
   stop(): Promise<void> {
-    if (this.#child === undefined) return Promise.resolve();
+    if (!this.processOwned) {
+      this.#completeOwnership();
+      return Promise.resolve();
+    }
     return this.#beginTermination(new Error("Pi RPC process stopped"));
   }
 
@@ -234,7 +303,7 @@ export class PiRpcProcess extends EventEmitter {
   }
 
   #transportFailure(error: Error): void {
-    if (this.#child === undefined) return;
+    if (!this.processOwned) return;
     this.#acceptingCommands = false;
     this.#terminationReason ??= error;
     this.#rejectPending(this.#terminationReason);
@@ -244,7 +313,10 @@ export class PiRpcProcess extends EventEmitter {
   }
 
   #beginTermination(reason: Error): Promise<void> {
-    if (this.#child === undefined) return Promise.resolve();
+    if (!this.processOwned) {
+      this.#completeOwnership();
+      return Promise.resolve();
+    }
     if (this.#terminationStarted) return this.#terminationStarted;
     this.#acceptingCommands = false;
     this.#terminationReason ??= reason;
@@ -254,29 +326,61 @@ export class PiRpcProcess extends EventEmitter {
   }
 
   async #terminateOwnedProcess(): Promise<void> {
-    const exitPromise = this.#exitPromise;
-    if (!exitPromise || this.#child === undefined) return;
+    const ownershipPromise = this.#ownershipPromise;
+    if (!ownershipPromise) return;
     const startedAt = Date.now();
     const termBudgetMs = Math.max(1, Math.floor(this.#options.shutdownGraceMs / 2));
-    this.#killProcessTree("SIGTERM");
-    if (await waitFor(exitPromise, termBudgetMs)) return;
-    this.#killProcessTree("SIGKILL");
+    this.#signalOwnedTree("SIGTERM");
+    if (await this.#waitForOwnershipRelease(termBudgetMs)) return;
+    this.#signalOwnedTree("SIGKILL");
     const remainingMs = Math.max(1, this.#options.shutdownGraceMs - (Date.now() - startedAt));
-    if (await waitFor(exitPromise, remainingMs)) return;
-    throw new Error(`Pi RPC process ${this.#child?.pid ?? "unknown"} did not exit after SIGKILL`);
+    if (await this.#waitForOwnershipRelease(remainingMs)) return;
+    throw new Error(`Pi process group ${this.pid ?? "unknown"} did not exit after SIGKILL`);
   }
 
-  #confirmExit(error: Error): void {
-    if (this.#child === undefined) return;
+  async #waitForOwnershipRelease(timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (!this.processOwned) {
+        this.#completeOwnership();
+        return true;
+      }
+      await delay(Math.min(5, Math.max(1, deadline - Date.now())));
+    }
+    if (!this.processOwned) {
+      this.#completeOwnership();
+      return true;
+    }
+    return false;
+  }
+
+  #leaderExited(child: SpawnedProcess, error: Error): void {
+    if (this.#child !== child) return;
     this.#child = undefined;
+    this.#processGroup?.markLeaderExited();
     this.#acceptingCommands = false;
     this.#terminationReason ??= error;
     this.#rejectPending(this.#terminationReason);
-    this.#resolveExit?.();
-    this.#resolveExit = undefined;
+    if (!this.processOwned) {
+      this.#completeOwnership();
+      return;
+    }
+    void this.#beginTermination(this.#terminationReason).catch((stopError: unknown) => {
+      this.#options.logger?.(`Failed to terminate Pi process group: ${errorMessage(stopError)}\n`);
+    });
+  }
+
+  #completeOwnership(): void {
+    if (this.processOwned) return;
+    this.#processGroup?.release();
+    this.#processGroup = undefined;
+    this.#child = undefined;
+    this.#acceptingCommands = false;
+    this.#resolveOwnership?.();
+    this.#resolveOwnership = undefined;
     if (!this.#exitNotified) {
       this.#exitNotified = true;
-      this.emit("exit", this.#terminationReason);
+      this.emit("exit", this.#terminationReason ?? new Error("Pi RPC process exited"));
     }
   }
 
@@ -302,32 +406,19 @@ export class PiRpcProcess extends EventEmitter {
     this.#options.logger?.(text);
   }
 
-  #killProcessTree(signal: NodeJS.Signals): void {
-    const child = this.#child;
-    if (!child) return;
-    if (process.platform !== "win32" && child.pid) {
-      try {
-        process.kill(-child.pid, signal);
-        return;
-      } catch {}
+  #signalOwnedTree(signal: NodeJS.Signals): void {
+    if (this.#processGroup) {
+      this.#processGroup.signal(signal);
+      return;
     }
     try {
-      child.kill(signal);
+      this.#child?.kill(signal);
     } catch {}
   }
 }
 
-async function waitFor(promise: Promise<void>, timeoutMs: number): Promise<boolean> {
-  let timer: NodeJS.Timeout | undefined;
-  const timedOut = Symbol("timed-out");
-  const result = await Promise.race([
-    promise.then(() => undefined),
-    new Promise<symbol>((resolve) => {
-      timer = setTimeout(() => resolve(timedOut), timeoutMs);
-    }),
-  ]);
-  if (timer) clearTimeout(timer);
-  return result !== timedOut;
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function errorMessage(error: unknown): string {

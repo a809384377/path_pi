@@ -16,6 +16,7 @@ let lastText = null;
 let buffer = "";
 let taskTimer;
 let toolChild;
+let leaderExitsOnTerm = false;
 
 function ensureSession() {
   mkdirSync(dirname(sessionFile), { recursive: true });
@@ -78,7 +79,12 @@ function handle(command) {
       const delayMatch = command.message.match(/delay:(\d+)/);
       const delay = delayMatch ? Number(delayMatch[1]) : 15;
       if (command.message.includes("spawn-tool-child")) {
-        toolChild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+        const stubborn = command.message.includes("stubborn-tool-child");
+        const code = stubborn
+          ? 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)'
+          : "setInterval(() => {}, 1000)";
+        toolChild = spawn(process.execPath, ["-e", code], { stdio: "ignore" });
+        leaderExitsOnTerm = command.message.includes("leader-exits-on-term");
         persist();
       }
       if (command.message === "CRASH") {
@@ -124,6 +130,9 @@ function handle(command) {
 }
 
 ensureSession();
+process.on("SIGTERM", () => {
+  if (leaderExitsOnTerm) process.exit(0);
+});
 process.stdin.on("data", (chunk) => {
   buffer += chunk.toString("utf8");
   let index = buffer.indexOf("\n");

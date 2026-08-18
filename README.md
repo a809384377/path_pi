@@ -115,9 +115,10 @@ With a `session_id`, returns one session. With no arguments, lists all non-close
 
 Important fields:
 
-- `state`: `dormant`, `restoring`, `dispatching`, `running`, `idle`, `error`, `closing`, or `closed`
+- `state`: `dormant`, `restoring`, `dispatching`, `running`, `finalizing`, `idle`, `error`, `closing`, or `closed`
 - `resident`: whether an OS process currently exists
 - `recoverable`: whether the saved Pi session may be resumed
+- `finalizing` means a terminal task outcome is being durably saved. The session remains busy and cannot accept `pi_send` until publication succeeds.
 - `current_task_id` and `last_task`
 
 ### `pi_close`

@@ -27,6 +27,7 @@ export type TaskStatus = "dispatching" | "running" | StoredTaskStatus;
 export interface TaskRecord {
   taskId: string;
   sessionId: string;
+  generation: number;
   status: TaskStatus;
   response?: string;
   error?: string;
@@ -155,7 +156,7 @@ export class SessionManager extends EventEmitter {
 
     const sessionId = `pi_${this.#options.idFactory()}`;
     const taskId = `task_${this.#options.idFactory()}`;
-    const task = createTask(taskId, sessionId);
+    const task = createTask(taskId, sessionId, 1);
     const session: SessionRecord = {
       sessionId,
       generation: 1,
@@ -194,8 +195,8 @@ export class SessionManager extends EventEmitter {
     const wasResident = session.state === "idle" && session.process !== undefined;
     if (!wasResident) this.#assertProcessCapacity();
     const taskId = `task_${this.#options.idFactory()}`;
-    const task = createTask(taskId, sessionId);
     session.generation += 1;
+    const task = createTask(taskId, sessionId, session.generation);
     session.activeTaskId = taskId;
     session.state = wasResident ? "dispatching" : "restoring";
     this.#tasks.set(taskId, task);
@@ -218,6 +219,13 @@ export class SessionManager extends EventEmitter {
       if (!this.#tasks.has(id)) throw new Error(`unknown_task: ${id}`);
     }
 
+    const persistenceFailure = (): Error | undefined => {
+      const failed = ids.map((id) => this.#tasks.get(id)!).find((task) => task.persistenceError);
+      return failed ? new Error(`persistence_error: task ${failed.taskId}: ${failed.persistenceError}`) : undefined;
+    };
+    const initialFailure = persistenceFailure();
+    if (initialFailure) throw initialFailure;
+
     const evaluate = (): WaitResult | undefined => {
       const completed = ids.map((id) => this.#tasks.get(id)!).filter(isPublishedTerminal);
       const ready = mode === "all" ? completed.length === ids.length : completed.length > 0;
@@ -234,20 +242,39 @@ export class SessionManager extends EventEmitter {
     if (immediate) return immediate;
     if (timeoutMs === 0) return this.#timeoutResult(ids);
 
-    return new Promise<WaitResult>((resolve) => {
+    return new Promise<WaitResult>((resolve, reject) => {
       let settled = false;
       const finish = (result: WaitResult): void => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
         this.off("taskTerminal", onTerminal);
+        this.off("taskPersistenceError", onPersistenceError);
         resolve(result);
       };
       const onTerminal = (): void => {
+        const failure = persistenceFailure();
+        if (failure) {
+          fail(failure);
+          return;
+        }
         const result = evaluate();
         if (result) finish(result);
       };
+      const fail = (error: Error): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.off("taskTerminal", onTerminal);
+        this.off("taskPersistenceError", onPersistenceError);
+        reject(error);
+      };
+      const onPersistenceError = (): void => {
+        const failure = persistenceFailure();
+        if (failure) fail(failure);
+      };
       this.on("taskTerminal", onTerminal);
+      this.on("taskPersistenceError", onPersistenceError);
       const timer = setTimeout(() => finish(this.#timeoutResult(ids)), timeoutMs);
       onTerminal();
     });
@@ -264,12 +291,6 @@ export class SessionManager extends EventEmitter {
     const session = this.#requireSession(sessionId);
     session.closeRequested = true;
     await this.#cleanupSession(session, "close");
-    if (session.state !== "closed") {
-      session.state = "closed";
-      session.recoverable = false;
-      session.activeTaskId = null;
-      await this.#persist();
-    }
     return toSessionStatus(session);
   }
 
@@ -282,7 +303,15 @@ export class SessionManager extends EventEmitter {
 
   async #runShutdown(): Promise<void> {
     const sessions = [...this.#sessions.values()].filter((session) => session.state !== "closed");
-    await Promise.all(sessions.map((session) => this.#cleanupSession(session, "shutdown")));
+    const outcomes = await Promise.allSettled(sessions.map((session) => this.#cleanupSession(session, "shutdown")));
+    const failures = outcomes
+      .filter((outcome): outcome is PromiseRejectedResult => outcome.status === "rejected")
+      .map((outcome) => outcome.reason);
+    if (failures.length > 0) {
+      this.#manifest.cleanShutdown = false;
+      await this.#persist().catch((error: unknown) => failures.push(error));
+      throw new AggregateError(failures, `Failed to cleanly shut down ${failures.length} Pi session(s)`);
+    }
     this.#manifest.cleanShutdown = true;
     await this.#persist();
   }
@@ -469,9 +498,12 @@ export class SessionManager extends EventEmitter {
     task.published = true;
     task.finalizing = false;
     session.lastTask = task;
-    if (session.activeTaskId === task.taskId) session.activeTaskId = null;
-    session.state = nextState;
-    session.recoverable = nextState === "idle" || (nextState === "error" && Boolean(session.sessionFile) && session.process === undefined);
+    const lifecycleOwnsSession = session.closeRequested || session.state === "closing" || session.state === "closed";
+    if (!lifecycleOwnsSession) {
+      if (session.activeTaskId === task.taskId && session.generation === task.generation) session.activeTaskId = null;
+      session.state = nextState;
+      session.recoverable = nextState === "idle" || (nextState === "error" && Boolean(session.sessionFile) && session.process === undefined);
+    }
     this.emit("taskTerminal", task.taskId);
     return true;
   }
@@ -487,13 +519,14 @@ export class SessionManager extends EventEmitter {
   }
 
   #fromStoredSession(stored: StoredSession, wasClean: boolean): SessionRecord {
-    let lastTask = stored.lastTask ? fromStoredTask(stored.lastTask) : undefined;
+    let lastTask = stored.lastTask ? fromStoredTask(stored.lastTask, stored.generation) : undefined;
     const hadActiveTask = stored.activeTaskId !== null || stored.state === "running";
     if (hadActiveTask) {
       const interruptedId = stored.activeTaskId ?? `task_interrupted_${this.#options.idFactory()}`;
       lastTask = {
         taskId: interruptedId,
         sessionId: stored.sessionId,
+        generation: stored.generation,
         status: "host_interrupted",
         error: "Previous MCP host stopped before the task completed",
         completedAt: new Date().toISOString(),
@@ -531,16 +564,16 @@ export class SessionManager extends EventEmitter {
   }
 
   async #runCleanup(session: SessionRecord): Promise<void> {
+    const failures: unknown[] = [];
     session.state = "closing";
     session.recoverable = false;
-    const task = session.activeTaskId ? this.#tasks.get(session.activeTaskId) : undefined;
+    const ownedTaskId = session.activeTaskId;
+    const ownedGeneration = session.generation;
+    const task = ownedTaskId ? this.#tasks.get(ownedTaskId) : undefined;
     if (task?.finalizationPromise) await task.finalizationPromise;
     if (task?.persistenceError) {
-      session.state = "error";
-      session.recoverable = false;
-      throw new Error(`Failed to persist terminal outcome for ${task.taskId}: ${task.persistenceError}`);
-    }
-    if (task && !task.published) {
+      failures.push(new Error(`Failed to persist terminal outcome for ${task.taskId}: ${task.persistenceError}`));
+    } else if (task && !task.published) {
       const published = await this.#finalizeTask(
         session,
         task,
@@ -548,29 +581,46 @@ export class SessionManager extends EventEmitter {
         { error: session.closeRequested ? "Session was closed" : "MCP host shut down" },
         "closing",
       );
-      if (!published) throw new Error(`Failed to persist terminal outcome for ${task.taskId}`);
+      if (!published) failures.push(new Error(`Failed to persist terminal outcome for ${task.taskId}`));
     } else {
-      await this.#persist();
+      try {
+        await this.#persist();
+      } catch (error) {
+        failures.push(error);
+      }
     }
 
     const rpc = session.process;
     if (rpc) {
       const graceMs = this.#options.shutdownGraceMs ?? 1_000;
-      const [abortResult, stopResult] = await Promise.allSettled([rpc.abort(graceMs), rpc.stop()]);
-      void abortResult;
+      const [, stopResult] = await Promise.allSettled([rpc.abort(graceMs), rpc.stop()]);
       if (stopResult.status === "rejected" || rpc.processOwned) {
-        session.state = "error";
-        session.recoverable = false;
-        await this.#persist().catch(() => undefined);
-        throw stopResult.status === "rejected" ? stopResult.reason : new Error(`Pi process ${rpc.pid ?? "unknown"} exit not confirmed`);
+        failures.push(
+          stopResult.status === "rejected"
+            ? stopResult.reason
+            : new Error(`Pi process group ${rpc.pid ?? "unknown"} exit not confirmed`),
+        );
+      } else if (session.process === rpc) {
+        session.process = undefined;
       }
-      if (session.process === rpc) session.process = undefined;
     }
 
-    session.activeTaskId = null;
-    session.state = session.closeRequested ? "closed" : session.sessionFile ? "dormant" : "error";
-    session.recoverable = !session.closeRequested && Boolean(session.sessionFile);
-    await this.#persist();
+    if (session.activeTaskId === ownedTaskId && session.generation === ownedGeneration) session.activeTaskId = null;
+    if (failures.length === 0) {
+      session.state = session.closeRequested ? "closed" : session.sessionFile ? "dormant" : "error";
+      session.recoverable = !session.closeRequested && Boolean(session.sessionFile);
+      try {
+        await this.#persist();
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length > 0) {
+      session.state = "error";
+      session.recoverable = false;
+      await this.#persist().catch((error: unknown) => failures.push(error));
+      throw new AggregateError(failures, `Failed to clean up Pi session ${session.sessionId}`);
+    }
   }
 
   async #persist(): Promise<void> {
@@ -604,10 +654,11 @@ export class SessionManager extends EventEmitter {
   }
 }
 
-function createTask(taskId: string, sessionId: string): TaskRecord {
+function createTask(taskId: string, sessionId: string, generation: number): TaskRecord {
   return {
     taskId,
     sessionId,
+    generation,
     status: "dispatching",
     published: false,
     finalizing: false,
@@ -701,9 +752,10 @@ function toStoredTask(task: TaskRecord & { status: StoredTaskStatus; completedAt
   };
 }
 
-function fromStoredTask(task: StoredTask): TaskRecord {
+function fromStoredTask(task: StoredTask, generation = 1): TaskRecord {
   return {
     ...task,
+    generation,
     published: true,
     finalizing: false,
     promptAccepted: true,

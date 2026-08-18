@@ -101,6 +101,15 @@ class DeferredCleanupRpc extends ControlledRpc {
   }
 }
 
+class ImmediateFailureRpc extends ControlledRpc {
+  override async stop(): Promise<void> {
+    throw new Error("immediate cleanup failure");
+  }
+  override get processOwned(): boolean {
+    return true;
+  }
+}
+
 class UnconfirmedExitRpc extends ControlledRpc {
   override async stop(): Promise<void> {
     throw new Error("exit not confirmed");
@@ -142,6 +151,13 @@ class GatedStore extends JsonSessionStore {
   }
 }
 
+function flattenErrorMessages(error: unknown): string {
+  if (error instanceof AggregateError) {
+    return `${error.message}\n${error.errors.map(flattenErrorMessages).join("\n")}`;
+  }
+  return String(error);
+}
+
 interface Harness {
   manager: SessionManager;
   directory: string;
@@ -155,6 +171,30 @@ async function readStateWithToolPid(path: string): Promise<{ pid: number; toolCh
     await new Promise((resolve) => setTimeout(resolve, 2));
   }
   throw new Error("fake Pi did not record its tool child PID");
+}
+
+async function waitForFile(directory: string, prefix: string): Promise<string> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const name = (await readdir(directory)).find((entry) => entry.startsWith(prefix));
+    if (name) return name;
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  throw new Error(`file with prefix ${prefix} did not appear`);
+}
+
+async function waitForPidGone(pid: number): Promise<void> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {}
+  throw new Error(`process ${pid} remained alive`);
 }
 
 async function createHarness(directory?: string): Promise<Harness> {
@@ -370,14 +410,46 @@ test("SessionManager keeps storage-failed terminal state unpublished and non-dis
   const registeredWaiter = manager.wait([task.task_id], "all", 10);
   store.rejectNextSave(new Error("disk full"));
   rpc!.emit("event", { type: "agent_settled" });
-  assert.equal((await registeredWaiter).timed_out, true);
-  assert.equal((await manager.wait([task.task_id], "any", 0)).timed_out, true);
+  await assert.rejects(registeredWaiter, /persistence_error.*disk full/);
+  await assert.rejects(manager.wait([task.task_id], "any", 0), /persistence_error.*disk full/);
   const status = manager.status(task.session_id);
   assert.equal(status.state, "error");
   assert.equal(status.recoverable, false);
   assert.match(status.persistence_error ?? "", /disk full/);
   await assert.rejects(manager.send(task.session_id, "next"), /session_not_recoverable/);
-  await assert.rejects(manager.shutdown(), /Failed to persist terminal outcome/);
+  await assert.rejects(manager.shutdown(), (error: unknown) => {
+    assert.match(flattenErrorMessages(error), /Failed to persist terminal outcome/);
+    return true;
+  });
+});
+
+test("SessionManager cleans real process group after persistence failure and keeps manifest dirty", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-agent-manager-"));
+  const storePath = join(directory, "sessions.json");
+  const store = new GatedStore(storePath);
+  const manager = new SessionManager({
+    store,
+    executable: fixture,
+    commandTimeoutMs: 3_000,
+    shutdownGraceMs: 100,
+  });
+  await manager.initialize();
+  const task = await manager.spawn({
+    task: "spawn-tool-child stubborn-tool-child leader-exits-on-term delay:20",
+    cwd: directory,
+  });
+  const stateFile = await waitForFile(directory, ".fake-pi-state-");
+  const processState = await readStateWithToolPid(join(directory, stateFile));
+  const registeredWait = manager.wait([task.task_id], "all", 1_000);
+  store.rejectNextSave(new Error("disk full"));
+  await assert.rejects(registeredWait, /persistence_error.*disk full/);
+  await assert.rejects(manager.wait([task.task_id], "all", 0), /persistence_error.*disk full/);
+  await assert.rejects(manager.shutdown(), /Failed to cleanly shut down/);
+  await waitForPidGone(processState.pid);
+  await waitForPidGone(processState.toolChildPid);
+  const manifest = JSON.parse(await readFile(storePath, "utf8"));
+  assert.equal(manifest.cleanShutdown, false);
+  assert.equal(manager.status(task.session_id).recoverable, false);
 });
 
 test("SessionManager coalesces concurrent close and shutdown without reopening closed session", async () => {
@@ -411,12 +483,77 @@ test("SessionManager refuses clean shutdown when process exit is unconfirmed", a
   });
   await manager.initialize();
   const task = await manager.spawn({ task: "work", cwd: directory });
-  await assert.rejects(manager.shutdown(), /exit not confirmed/);
+  await assert.rejects(manager.shutdown(), (error: unknown) => {
+    assert.ok(error instanceof AggregateError);
+    assert.match(flattenErrorMessages(error), /exit not confirmed/);
+    return true;
+  });
   const status = manager.status(task.session_id);
   assert.equal(status.state, "error");
   assert.equal(status.recoverable, false);
   const manifest = JSON.parse(await readFile(storePath, "utf8"));
   assert.equal(manifest.cleanShutdown, false);
+});
+
+test("SessionManager shutdown waits for delayed cleanup after another cleanup fails", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-agent-manager-"));
+  let invocation = 0;
+  let delayed: DeferredCleanupRpc | undefined;
+  const manager = new SessionManager({
+    store: new JsonSessionStore(join(directory, "sessions.json")),
+    rpcFactory: () => {
+      invocation += 1;
+      if (invocation === 1) return new ImmediateFailureRpc(directory);
+      delayed = new DeferredCleanupRpc(directory);
+      return delayed;
+    },
+  });
+  await manager.initialize();
+  await Promise.all([
+    manager.spawn({ task: "fails", cwd: directory }),
+    manager.spawn({ task: "delayed", cwd: directory }),
+  ]);
+  let rejected = false;
+  const shutdown = manager.shutdown().catch((error: unknown) => {
+    rejected = true;
+    throw error;
+  });
+  await delayed!.stopEntered;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(rejected, false);
+  delayed!.releaseStop();
+  await assert.rejects(shutdown, (error: unknown) => {
+    assert.ok(error instanceof AggregateError);
+    assert.match(flattenErrorMessages(error), /immediate cleanup failure/);
+    return true;
+  });
+});
+
+test("SessionManager close retains lifecycle ownership across gated terminal publication", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-agent-manager-"));
+  const store = new GatedStore(join(directory, "sessions.json"));
+  let rpc: DeferredCleanupRpc | undefined;
+  let generatedIds = 0;
+  const manager = new SessionManager({
+    store,
+    rpcFactory: () => (rpc = new DeferredCleanupRpc(directory)),
+    idFactory: () => String(++generatedIds),
+  });
+  await manager.initialize();
+  const task = await manager.spawn({ task: "work", cwd: directory });
+  store.gateNextSave();
+  rpc!.emit("event", { type: "agent_settled" });
+  await new Promise((resolve) => setImmediate(resolve));
+  const waiterSend = manager.wait([task.task_id], "all", 500).then(() => manager.send(task.session_id, "ghost"));
+  const closing = manager.close(task.session_id);
+  store.releaseSave();
+  await assert.rejects(waiterSend, /session_busy|session_closed/);
+  await rpc!.stopEntered;
+  rpc!.releaseStop();
+  await closing;
+  assert.equal(manager.status(task.session_id).state, "closed");
+  assert.equal(manager.status(task.session_id).current_task_id, null);
+  assert.equal(generatedIds, 2);
 });
 
 test("SessionManager starts cleanup for all sessions in parallel", async () => {

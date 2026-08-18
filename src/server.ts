@@ -84,7 +84,8 @@ export function registerTools(server: McpServer, manager: SessionManager): void 
   server.registerTool(
     "pi_status",
     {
-      description: "Inspect one Pi session, or list all non-closed sessions when session_id is omitted. This never starts a dormant process.",
+      description:
+        "Inspect one Pi session, or list all non-closed sessions when session_id is omitted. This never starts a dormant process. finalizing means the terminal outcome is still being durably saved and the session remains busy.",
       inputSchema: {
         session_id: z.string().min(1).optional(),
       },

@@ -22,8 +22,29 @@ async function waitFor<T>(read: () => T | undefined | Promise<T | undefined>, ti
   throw new Error("condition not reached before timeout");
 }
 
-function assertProcessGone(pid: number): void {
-  assert.throws(() => process.kill(pid, 0));
+async function waitForProcessGone(pid: number, timeoutMs = 2_000): Promise<void> {
+  await waitFor(() => {
+    try {
+      process.kill(pid, 0);
+      return undefined;
+    } catch {
+      return true;
+    }
+  }, timeoutMs);
+}
+
+function killKnownProcessTree(pgid: number | undefined, pids: readonly (number | undefined)[]): void {
+  if (pgid !== undefined) {
+    try {
+      process.kill(-pgid, "SIGKILL");
+    } catch {}
+  }
+  for (const pid of pids) {
+    if (pid === undefined) continue;
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {}
+  }
 }
 
 test("stdio EOF performs clean bounded shutdown of server, Pi, and tool child", async () => {
@@ -61,6 +82,9 @@ test("stdio EOF performs clean bounded shutdown of server, Pi, and tool child", 
     return response.result;
   };
 
+  let serverPid: number | undefined;
+  let piPid: number | undefined;
+  let toolChildPid: number | undefined;
   try {
     await request("initialize", {
       protocolVersion: "2025-11-25",
@@ -70,7 +94,7 @@ test("stdio EOF performs clean bounded shutdown of server, Pi, and tool child", 
     server.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
     const spawnResult = await request("tools/call", {
       name: "pi_spawn",
-      arguments: { task: "spawn-tool-child", cwd: directory },
+      arguments: { task: "spawn-tool-child stubborn-tool-child leader-exits-on-term", cwd: directory },
     }) as { content: Array<{ text: string }> };
     const spawned = JSON.parse(spawnResult.content[0]!.text) as { task_id: string };
     await request("tools/call", {
@@ -83,7 +107,9 @@ test("stdio EOF performs clean bounded shutdown of server, Pi, and tool child", 
     );
     const state = JSON.parse(await readFile(join(directory, stateFile), "utf8")) as { pid: number; toolChildPid: number };
     assert.ok(state.toolChildPid);
-    const serverPid = server.pid!;
+    piPid = state.pid;
+    toolChildPid = state.toolChildPid;
+    serverPid = server.pid!;
     server.stdin.end();
     const exit = await Promise.race([
       new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) =>
@@ -93,12 +119,12 @@ test("stdio EOF performs clean bounded shutdown of server, Pi, and tool child", 
     ]);
     assert.equal(exit.code, 0);
     assert.equal(exit.signal, null);
-    assertProcessGone(serverPid);
-    assertProcessGone(state.pid);
-    assertProcessGone(state.toolChildPid);
+    await waitForProcessGone(serverPid);
+    await waitForProcessGone(piPid);
+    await waitForProcessGone(toolChildPid);
     const manifest = JSON.parse(await readFile(join(stateDirectory, "sessions.json"), "utf8"));
     assert.equal(manifest.cleanShutdown, true);
   } finally {
-    if (server.exitCode === null && server.signalCode === null) server.kill("SIGKILL");
+    killKnownProcessTree(piPid, [serverPid, piPid, toolChildPid]);
   }
 });
