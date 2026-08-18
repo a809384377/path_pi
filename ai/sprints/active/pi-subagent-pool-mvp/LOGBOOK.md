@@ -23,6 +23,8 @@
 - Step 1–4 实现位于 `src/`、`test/` 和 `README.md`；五工具注册入口为 `src/server.ts`。
 - Pi transport 对接点是 `PiRpcProcess`；session/task 不变式集中在 `SessionManager`；持久化契约集中在 `JsonSessionStore`。
 - 主会话验收命令 `npm run typecheck`、`npm test`、`npm pack --dry-run` 全部 exit 0；当前 18 tests pass。
+- Step 5 第一轮独立审查原文：`ai/scratch/pi-subagent-pool-mvp/review-lifecycle.md`、`ai/scratch/pi-subagent-pool-mvp/review-api-test.md`。
+- 处置: 修复全部 spec 内 Blocker/Major；补 prepack 与 LICENSE；Windows process-tree 不在 MVP 扩展实现，明确限定 macOS/Linux；修复后进行 focused re-review。
 
 ---
 
