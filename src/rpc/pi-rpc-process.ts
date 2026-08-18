@@ -16,7 +16,7 @@ export interface SpawnedProcess {
   stdout: NodeJS.ReadableStream;
   stderr: NodeJS.ReadableStream;
   once(event: "error", listener: (error: Error) => void): this;
-  once(event: "exit", listener: (code: number | null, signal: NodeJS.Signals | null) => void): this;
+  once(event: "exit" | "close", listener: (code: number | null, signal: NodeJS.Signals | null) => void): this;
   kill(signal?: NodeJS.Signals | number): boolean;
   readonly killed?: boolean | undefined;
   readonly pid?: number | undefined;
@@ -56,10 +56,13 @@ export class PiRpcProcess extends EventEmitter {
   readonly #decoder = new JsonlDecoder();
   #child: SpawnedProcess | undefined;
   #requestSequence = 0;
-  #closed = false;
+  #acceptingCommands = false;
   #stderr = "";
   #exitPromise: Promise<void> | undefined;
   #resolveExit: (() => void) | undefined;
+  #terminationReason: Error | undefined;
+  #terminationStarted: Promise<void> | undefined;
+  #exitNotified = false;
 
   constructor(options: PiRpcProcessOptions) {
     super();
@@ -73,7 +76,11 @@ export class PiRpcProcess extends EventEmitter {
   }
 
   get running(): boolean {
-    return this.#child !== undefined && !this.#closed;
+    return this.#child !== undefined && this.#acceptingCommands;
+  }
+
+  get processOwned(): boolean {
+    return this.#child !== undefined;
   }
 
   get pid(): number | undefined {
@@ -86,7 +93,10 @@ export class PiRpcProcess extends EventEmitter {
 
   async start(): Promise<PiSessionState> {
     if (this.#child !== undefined) throw new Error("Pi RPC process has already been started");
-    this.#closed = false;
+    this.#acceptingCommands = true;
+    this.#terminationReason = undefined;
+    this.#terminationStarted = undefined;
+    this.#exitNotified = false;
     const args = ["--mode", "rpc"];
     if (this.#options.model) args.push("--model", this.#options.model);
 
@@ -102,13 +112,19 @@ export class PiRpcProcess extends EventEmitter {
     });
 
     child.stdout.on("data", (chunk: Buffer | string) => this.#consumeLines(this.#decoder.push(chunk)));
-    child.stdout.on("end", () => this.#consumeLines(this.#decoder.end()));
-    child.stderr.on("data", (chunk: Buffer | string) => this.#captureStderr(chunk));
-    child.once("error", (error) => this.#handleTermination(error));
-    child.once("exit", (code, signal) => {
-      const detail = signal ? `signal ${signal}` : `code ${code ?? "unknown"}`;
-      this.#handleTermination(new Error(`Pi RPC process exited with ${detail}`));
+    child.stdout.on("end", () => {
+      this.#consumeLines(this.#decoder.end());
+      if (this.#child === child) this.#transportFailure(new Error("Pi RPC stdout ended before process exit"));
     });
+    child.stderr.on("data", (chunk: Buffer | string) => this.#captureStderr(chunk));
+    child.stdin.on("error", (error: Error) => this.#transportFailure(error));
+    child.once("error", (error) => this.#transportFailure(error));
+    const confirmProcessExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+      const detail = signal ? `signal ${signal}` : `code ${code ?? "unknown"}`;
+      this.#confirmExit(this.#terminationReason ?? new Error(`Pi RPC process exited with ${detail}`));
+    };
+    child.once("exit", confirmProcessExit);
+    child.once("close", confirmProcessExit);
 
     try {
       return await this.getState();
@@ -134,47 +150,26 @@ export class PiRpcProcess extends EventEmitter {
     return this.#send<LastAssistantTextResult>({ type: "get_last_assistant_text" });
   }
 
-  abort(): Promise<void> {
-    return this.#send<void>({ type: "abort" }).then(() => undefined);
+  abort(timeoutMs = this.#options.commandTimeoutMs): Promise<void> {
+    return this.#send<void>({ type: "abort" }, timeoutMs).then(() => undefined);
   }
 
-  async stop(): Promise<void> {
+  stop(): Promise<void> {
+    if (this.#child === undefined) return Promise.resolve();
+    return this.#beginTermination(new Error("Pi RPC process stopped"));
+  }
+
+  #send<T>(command: RpcCommand, timeoutMs = this.#options.commandTimeoutMs): Promise<T> {
     const child = this.#child;
-    if (child === undefined) return;
-    if (this.#closed) {
-      await this.#exitPromise;
-      return;
-    }
-
-    this.#closed = true;
-    this.#rejectPending(new Error("Pi RPC process stopped"));
-    this.#killProcessTree("SIGTERM");
-
-    const exited = this.#exitPromise ?? Promise.resolve();
-    let timer: NodeJS.Timeout | undefined;
-    await Promise.race([
-      exited,
-      new Promise<void>((resolve) => {
-        timer = setTimeout(resolve, this.#options.shutdownGraceMs);
-      }),
-    ]);
-    if (timer) clearTimeout(timer);
-    if (this.#child !== undefined) {
-      this.#killProcessTree("SIGKILL");
-      await Promise.race([exited, new Promise<void>((resolve) => setTimeout(resolve, 100))]);
-    }
-  }
-
-  #send<T>(command: RpcCommand): Promise<T> {
-    if (this.#child === undefined || this.#closed) {
+    if (child === undefined || !this.#acceptingCommands) {
       return Promise.reject(new Error("Pi RPC process is not running"));
     }
     const id = `rpc_${++this.#requestSequence}`;
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.#pending.delete(id);
-        reject(new Error(`Pi RPC ${command.type} timed out after ${this.#options.commandTimeoutMs}ms`));
-      }, this.#options.commandTimeoutMs);
+        reject(new Error(`Pi RPC ${command.type} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
       this.#pending.set(id, {
         command: command.type,
         resolve: (response) => resolve(response.data as T),
@@ -182,13 +177,10 @@ export class PiRpcProcess extends EventEmitter {
         timer,
       });
       const payload = `${JSON.stringify({ id, ...command })}\n`;
-      this.#child!.stdin.write(payload, (error?: Error | null) => {
+      child.stdin.write(payload, (error?: Error | null) => {
         if (!error) return;
-        const pending = this.#pending.get(id);
-        if (!pending) return;
-        this.#pending.delete(id);
-        clearTimeout(pending.timer);
-        pending.reject(error);
+        this.#rejectCommand(id, error);
+        this.#transportFailure(error);
       });
     });
   }
@@ -203,22 +195,23 @@ export class PiRpcProcess extends EventEmitter {
         return;
       }
 
-      if (isRpcResponse(message)) {
-        this.#handleResponse(message);
-      } else if (typeof message === "object" && message !== null && typeof (message as RpcEvent).type === "string") {
-        this.emit("event", message as RpcEvent);
-      } else {
+      if (typeof message !== "object" || message === null || Array.isArray(message) || typeof (message as RpcEvent).type !== "string") {
         this.#protocolFailure(new Error("Invalid message shape from Pi RPC"));
         return;
+      }
+      if ((message as RpcEvent).type === "response") {
+        if (!isRpcResponse(message)) {
+          this.#protocolFailure(new Error("Invalid Pi RPC response shape"));
+          return;
+        }
+        this.#handleResponse(message);
+      } else {
+        this.emit("event", message as RpcEvent);
       }
     }
   }
 
   #handleResponse(response: RpcResponse): void {
-    if (!response.id) {
-      this.#protocolFailure(new Error(`Uncorrelated Pi RPC response for ${response.command}`));
-      return;
-    }
     const pending = this.#pending.get(response.id);
     if (!pending) {
       this.#protocolFailure(new Error(`Unknown Pi RPC response id ${response.id}`));
@@ -237,18 +230,62 @@ export class PiRpcProcess extends EventEmitter {
 
   #protocolFailure(error: Error): void {
     this.emit("protocolError", error);
-    this.#killProcessTree("SIGTERM");
-    this.#handleTermination(error);
+    this.#transportFailure(error);
   }
 
-  #handleTermination(error: Error): void {
+  #transportFailure(error: Error): void {
+    if (this.#child === undefined) return;
+    this.#acceptingCommands = false;
+    this.#terminationReason ??= error;
+    this.#rejectPending(this.#terminationReason);
+    void this.#beginTermination(this.#terminationReason).catch((stopError: unknown) => {
+      this.#options.logger?.(`Failed to terminate Pi RPC process: ${errorMessage(stopError)}\n`);
+    });
+  }
+
+  #beginTermination(reason: Error): Promise<void> {
+    if (this.#child === undefined) return Promise.resolve();
+    if (this.#terminationStarted) return this.#terminationStarted;
+    this.#acceptingCommands = false;
+    this.#terminationReason ??= reason;
+    this.#rejectPending(this.#terminationReason);
+    this.#terminationStarted = this.#terminateOwnedProcess();
+    return this.#terminationStarted;
+  }
+
+  async #terminateOwnedProcess(): Promise<void> {
+    const exitPromise = this.#exitPromise;
+    if (!exitPromise || this.#child === undefined) return;
+    const startedAt = Date.now();
+    const termBudgetMs = Math.max(1, Math.floor(this.#options.shutdownGraceMs / 2));
+    this.#killProcessTree("SIGTERM");
+    if (await waitFor(exitPromise, termBudgetMs)) return;
+    this.#killProcessTree("SIGKILL");
+    const remainingMs = Math.max(1, this.#options.shutdownGraceMs - (Date.now() - startedAt));
+    if (await waitFor(exitPromise, remainingMs)) return;
+    throw new Error(`Pi RPC process ${this.#child?.pid ?? "unknown"} did not exit after SIGKILL`);
+  }
+
+  #confirmExit(error: Error): void {
     if (this.#child === undefined) return;
     this.#child = undefined;
-    this.#closed = true;
-    this.#rejectPending(error);
+    this.#acceptingCommands = false;
+    this.#terminationReason ??= error;
+    this.#rejectPending(this.#terminationReason);
     this.#resolveExit?.();
     this.#resolveExit = undefined;
-    this.emit("exit", error);
+    if (!this.#exitNotified) {
+      this.#exitNotified = true;
+      this.emit("exit", this.#terminationReason);
+    }
+  }
+
+  #rejectCommand(id: string, error: Error): void {
+    const pending = this.#pending.get(id);
+    if (!pending) return;
+    this.#pending.delete(id);
+    clearTimeout(pending.timer);
+    pending.reject(error);
   }
 
   #rejectPending(error: Error): void {
@@ -278,4 +315,21 @@ export class PiRpcProcess extends EventEmitter {
       child.kill(signal);
     } catch {}
   }
+}
+
+async function waitFor(promise: Promise<void>, timeoutMs: number): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  const timedOut = Symbol("timed-out");
+  const result = await Promise.race([
+    promise.then(() => undefined),
+    new Promise<symbol>((resolve) => {
+      timer = setTimeout(() => resolve(timedOut), timeoutMs);
+    }),
+  ]);
+  if (timer) clearTimeout(timer);
+  return result !== timedOut;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

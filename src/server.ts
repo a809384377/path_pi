@@ -111,18 +111,29 @@ export async function runStdioServer(): Promise<void> {
   const transport = new StdioServerTransport();
   let shuttingDown: Promise<void> | undefined;
   const shutdown = (): Promise<void> => {
-    shuttingDown ??= manager.shutdown().finally(() => server.close());
+    shuttingDown ??= manager.shutdown().then(() => server.close());
     return shuttingDown;
   };
 
   const handleSignal = (): void => {
-    void shutdown().finally(() => process.exit(0));
+    void shutdown()
+      .then(() => process.exit(0))
+      .catch((error: unknown) => {
+        process.stderr.write(`pi-agent-mcp shutdown failed: ${errorMessage(error)}\n`);
+        process.exit(1);
+      });
+  };
+  const handleInputEnd = (): void => {
+    void shutdown().catch((error: unknown) => {
+      process.stderr.write(`pi-agent-mcp shutdown failed: ${errorMessage(error)}\n`);
+      process.exitCode = 1;
+    });
   };
   process.once("SIGINT", handleSignal);
   process.once("SIGTERM", handleSignal);
-  transport.onclose = () => {
-    void shutdown();
-  };
+  process.stdin.once("end", handleInputEnd);
+  process.stdin.once("close", handleInputEnd);
+  transport.onclose = handleInputEnd;
   await server.connect(transport);
 }
 

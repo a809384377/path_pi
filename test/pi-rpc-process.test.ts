@@ -11,6 +11,8 @@ class FakeChild extends EventEmitter implements SpawnedProcess {
   readonly pid = undefined;
   readonly killed = false;
   writes: Record<string, unknown>[] = [];
+  killSignals: Array<NodeJS.Signals | number | undefined> = [];
+  autoExit = true;
 
   constructor() {
     super();
@@ -27,8 +29,9 @@ class FakeChild extends EventEmitter implements SpawnedProcess {
     });
   }
 
-  kill(): boolean {
-    queueMicrotask(() => this.emit("exit", null, "SIGTERM"));
+  kill(signal?: NodeJS.Signals | number): boolean {
+    this.killSignals.push(signal);
+    if (this.autoExit) queueMicrotask(() => this.emit("exit", null, signal ?? "SIGTERM"));
     return true;
   }
 
@@ -88,11 +91,72 @@ test("PiRpcProcess rejects pending commands on child crash", async () => {
   await assert.rejects(prompt, /exited with code 23/);
 });
 
-test("PiRpcProcess surfaces malformed JSON as a protocol failure", async () => {
+test("PiRpcProcess rejects malformed response shapes immediately", async () => {
   const child = new FakeChild();
-  const rpc = new PiRpcProcess({ cwd: "/tmp", processFactory: () => child, commandTimeoutMs: 500 });
+  const rpc = new PiRpcProcess({ cwd: "/tmp", processFactory: () => child, commandTimeoutMs: 5_000 });
+  const start = rpc.start();
+  await waitFor(() => child.writes.length === 1);
+  const request = child.writes[0]!;
+  child.stdout.write(`${JSON.stringify({ id: request.id, type: "response", command: "get_state" })}\n`);
+  await assert.rejects(start, /Invalid Pi RPC response shape/);
+});
+
+test("PiRpcProcess keeps ownership through protocol TERM and confirms KILL exit", async () => {
+  const child = new FakeChild();
+  child.autoExit = false;
+  const rpc = new PiRpcProcess({ cwd: "/tmp", processFactory: () => child, commandTimeoutMs: 500, shutdownGraceMs: 5 });
   const start = rpc.start();
   await waitFor(() => child.writes.length === 1);
   child.stdout.write("not-json\n");
   await assert.rejects(start, /Invalid JSON from Pi RPC/);
+  await waitFor(() => child.killSignals.includes("SIGKILL"));
+  assert.equal(rpc.processOwned, true);
+  child.emit("exit", null, "SIGKILL");
+  await rpc.stop();
+  assert.equal(rpc.processOwned, false);
+  assert.deepEqual(child.killSignals, ["SIGTERM", "SIGKILL"]);
+});
+
+test("PiRpcProcess fails stop when OS exit cannot be confirmed", async () => {
+  const child = new FakeChild();
+  child.autoExit = false;
+  const rpc = new PiRpcProcess({ cwd: "/tmp", processFactory: () => child, commandTimeoutMs: 500, shutdownGraceMs: 2 });
+  const start = rpc.start();
+  await waitFor(() => child.writes.length === 1);
+  child.respond(0, "get_state", {
+    sessionFile: "/tmp/session.jsonl",
+    sessionId: "session-1",
+    isStreaming: false,
+    isCompacting: false,
+    messageCount: 0,
+    pendingMessageCount: 0,
+  });
+  await start;
+  await assert.rejects(rpc.stop(), /did not exit after SIGKILL/);
+  assert.equal(rpc.processOwned, true);
+  child.emit("exit", null, "SIGKILL");
+});
+
+test("PiRpcProcess handles stdin EPIPE and exit as one termination", async () => {
+  const child = new FakeChild();
+  const rpc = new PiRpcProcess({ cwd: "/tmp", processFactory: () => child, commandTimeoutMs: 500, shutdownGraceMs: 5 });
+  const start = rpc.start();
+  await waitFor(() => child.writes.length === 1);
+  child.respond(0, "get_state", {
+    sessionFile: "/tmp/session.jsonl",
+    sessionId: "session-1",
+    isStreaming: false,
+    isCompacting: false,
+    messageCount: 0,
+    pendingMessageCount: 0,
+  });
+  await start;
+  let exitCount = 0;
+  rpc.on("exit", () => exitCount += 1);
+  const epipe = Object.assign(new Error("broken pipe"), { code: "EPIPE" });
+  child.stdin.emit("error", epipe);
+  child.emit("exit", 1, null);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(exitCount, 1);
+  assert.equal(rpc.processOwned, false);
 });

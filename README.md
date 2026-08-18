@@ -6,6 +6,7 @@ Each logical session owns one `pi --mode rpc` process while the MCP host is runn
 
 ## Requirements
 
+- macOS or Linux (`v0.1.0` uses POSIX process groups for verified process-tree cleanup; Windows is not supported)
 - Node.js 20 or newer
 - `pi` installed and available on `PATH`
 - A configured Pi model/provider
@@ -144,7 +145,7 @@ spawn(docs) ─┘
 This project implements **logical persistence**, not a daemon:
 
 - While Claude Code or Codex keeps the MCP server alive, completed Pi processes remain idle in the background.
-- On a graceful MCP shutdown, active tasks become `host_interrupted`, child processes are stopped, and Pi session file mappings are saved.
+- On macOS/Linux, graceful shutdown terminates each owned Pi process group, including tool subprocesses.
 - On the next server start, cleanly saved sessions appear as `dormant` and are lazily restored by the next `pi_send`.
 - Tasks do **not** continue after the MCP host exits and are never automatically replayed.
 - After an unclean host crash, dirty sessions are not automatically restored because an old process cannot be proven dead without a daemon or lease.

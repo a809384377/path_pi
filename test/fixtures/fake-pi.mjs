@@ -66,7 +66,15 @@ function handle(command) {
     case "prompt": {
       messages.push(command.message);
       persist();
-      response("prompt", command.id);
+      const rejectPrompt = command.message.includes("reject-prompt");
+      const settleBeforeResponse = command.message.includes("settle-before-response");
+      if (!settleBeforeResponse) {
+        if (rejectPrompt) {
+          send({ id: command.id, type: "response", command: "prompt", success: false, error: "prompt rejected" });
+          break;
+        }
+        response("prompt", command.id);
+      }
       const delayMatch = command.message.match(/delay:(\d+)/);
       const delay = delayMatch ? Number(delayMatch[1]) : 15;
       if (command.message.includes("spawn-tool-child")) {
@@ -78,10 +86,26 @@ function handle(command) {
         break;
       }
       taskTimer = setTimeout(() => {
-        lastText = `reply:${messages.join("|")}`;
+        const assistantError = command.message.includes("assistant-error");
+        lastText = assistantError ? null : `reply:${messages.join("|")}`;
         taskTimer = undefined;
         persist();
+        send({
+          type: "message_end",
+          message: assistantError
+            ? { role: "assistant", content: [], stopReason: "error", errorMessage: "provider authentication failed" }
+            : { role: "assistant", content: [{ type: "text", text: lastText }], stopReason: "stop" },
+        });
         send({ type: "agent_settled" });
+        if (settleBeforeResponse) {
+          setImmediate(() => {
+            if (rejectPrompt) {
+              send({ id: command.id, type: "response", command: "prompt", success: false, error: "prompt rejected" });
+            } else {
+              response("prompt", command.id);
+            }
+          });
+        }
       }, delay);
       break;
     }
@@ -89,6 +113,7 @@ function handle(command) {
       response("get_last_assistant_text", command.id, { text: lastText });
       break;
     case "abort":
+      if (messages.at(-1)?.includes("ignore-abort")) break;
       if (taskTimer) clearTimeout(taskTimer);
       taskTimer = undefined;
       response("abort", command.id);
