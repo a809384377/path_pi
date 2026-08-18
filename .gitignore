@@ -7,5 +7,5 @@ coverage/
 !.env.example
 ai/cache/
 .playwright-mcp/
-.pi/subagents/artifacts/
+.pi/subagents/
 .DS_Store
