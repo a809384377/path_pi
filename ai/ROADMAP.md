@@ -1,7 +1,7 @@
 # Roadmap
 
 ## 高优先级
-- [-] 实现可被其他 Agent 调用、支持并行与上下文复用的 Pi MCP Server
+- [x] 实现可被其他 Agent 调用、支持并行与上下文复用的 Pi MCP Server → `ai/sprints/archive/2026-08-18_completed_pi-subagent-pool-mvp/`
 
 ## 待解决的问题
 

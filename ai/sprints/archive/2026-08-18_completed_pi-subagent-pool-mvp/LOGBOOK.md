@@ -1,6 +1,6 @@
 # 日志
 
-## 状态: active
+## 状态: completed
 
 ---
 
@@ -27,9 +27,32 @@
 - 处置: 修复全部 spec 内 Blocker/Major；补 prepack 与 LICENSE；Windows process-tree 不在 MVP 扩展实现，明确限定 macOS/Linux；修复后进行 focused re-review。
 - Step 5 第二轮 focused review 原文：`ai/scratch/pi-subagent-pool-mvp/review2-termination.md`、`ai/scratch/pi-subagent-pool-mvp/review2-api.md`。
 - 第二轮处置: shutdown 改为等待全部 cleanup 后聚合失败；close 保持 lifecycle ownership；POSIX 以 process group 消失而非 leader exit 作为清理完成；persistence failure 仍执行 process cleanup 且 wait 明确报错；补齐 finalizing 文档与 E2E 清理稳健性。
+- Step 5 终审原文：`ai/scratch/pi-subagent-pool-mvp/review3-final.md`；结论 PASS，无 Blocker/Major。
 
 ---
 
 ## 踩坑记录
 
-（sprint 结束时提取，无踩坑则留空）
+（本 Sprint 的具体时序问题已固化为状态机不变式和回归测试，无需提炼新的跨项目规则。）
+
+---
+
+## Sprint 总结
+
+### 状态: completed
+### 周期: 2026-08-18 -> 2026-08-18
+
+### 目标与结果
+| 成功标准 | 结果 |
+|---------|------|
+| 暴露五个 Pi MCP 工具 | pass — `pi_spawn`、`pi_send`、`pi_wait`、`pi_status`、`pi_close` |
+| 三个 session 并行且结果不串线 | pass — fake Pi 并行集成测试覆盖 |
+| session 完成后继续派活并恢复上下文 | pass — resident reuse 与 clean restart lazy restore 覆盖 |
+| 生命周期与并发路径自动化测试 | pass — 35 tests 覆盖 wait、竞态、crash、close、shutdown、persistence 和 process group |
+| Claude Code/Codex 配置文档 | pass — README 提供可复制配置与调用流程 |
+| build/typecheck/test 和独立审查 | pass — typecheck/test/pack 通过，终审无 Blocker/Major |
+
+### 后续注意事项
+- v0.1.0 仅支持 macOS/Linux；Windows process-tree cleanup 不在本 Sprint 范围。
+- 多个 session 写同一 cwd 时仍由主 Agent 负责拆分任务或提供不同 worktree。
+- 宿主遭受 SIGKILL 或机器故障时不保证 task 继续执行，dirty session 会拒绝自动恢复。

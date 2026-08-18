@@ -27,12 +27,12 @@
 - 内容: 参数校验、稳定返回结构、工具说明引导主 Agent 使用 spawn→wait→send
 - 验证: fake Pi RPC 下完成 MCP 级 smoke，文档命令可复制执行
 
-## Step 5: 独立对抗审查与修复 [wip]
+## Step 5: 独立对抗审查与修复 [done]
 - 涉及: 当前完整 diff、review artifacts、必要修复
 - 内容: 并行审查正确性/竞态和测试/API；主会话核实后交回原 worker 修复 Blocker/Major
 - 验证: 复审无未处理 Blocker/Major
 
-## Step 6: 最终验收与 Sprint 收尾 [ ]
+## Step 6: 最终验收与 Sprint 收尾 [done]
 - 涉及: 全仓、Sprint 文档、ROADMAP/KNOWLEDGE
 - 内容: 全量 build/typecheck/test、关键代码验收、成功标准回填、提交和归档
 - 验证: Git 工作区干净，Sprint 成功标准全部可举证
