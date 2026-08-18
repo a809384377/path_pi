@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { JsonlDecoder } from "../src/rpc/jsonl.js";
+import { SessionRecordStore } from "../src/store/session-store.js";
 
 interface JsonRpcResponse {
   id?: number;
@@ -122,8 +123,10 @@ test("stdio EOF performs clean bounded shutdown of server, Pi, and tool child", 
     await waitForProcessGone(serverPid);
     await waitForProcessGone(piPid);
     await waitForProcessGone(toolChildPid);
-    const manifest = JSON.parse(await readFile(join(stateDirectory, "sessions.json"), "utf8"));
-    assert.equal(manifest.cleanShutdown, true);
+    const records = await new SessionRecordStore(stateDirectory).list();
+    assert.equal(records.length, 1);
+    assert.equal(records[0]?.state, "dormant");
+    assert.equal(records[0]?.recoverable, true);
   } finally {
     killKnownProcessTree(piPid, [serverPid, piPid, toolChildPid]);
   }

@@ -1,16 +1,28 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 
 const cwd = process.cwd();
+const argv = process.argv.slice(2);
 const statePath = join(cwd, `.fake-pi-state-${process.pid}.json`);
 const argsPath = join(cwd, `.fake-pi-args-${process.pid}.json`);
-writeFileSync(argsPath, JSON.stringify(process.argv.slice(2)));
+writeFileSync(argsPath, JSON.stringify(argv));
 
-let sessionFile = join(cwd, `.fake-pi-session-${process.pid}.jsonl`);
-let sessionId = `fake-${process.pid}`;
+function argument(name) {
+  const index = argv.indexOf(name);
+  return index === -1 ? undefined : argv[index + 1];
+}
+
+const restorePath = argument("--session");
+const sessionDirectory = argument("--session-dir");
+let sessionId = argument("--session-id") ?? `fake-${process.pid}`;
+let sessionFile = restorePath
+  ? resolve(restorePath)
+  : sessionDirectory
+    ? join(resolve(sessionDirectory), `session-${sessionId}.jsonl`)
+    : join(cwd, `.fake-pi-session-${process.pid}.jsonl`);
 let messages = [];
 let lastText = null;
 let buffer = "";
@@ -18,20 +30,28 @@ let taskTimer;
 let toolChild;
 let leaderExitsOnTerm = false;
 
-function ensureSession() {
-  mkdirSync(dirname(sessionFile), { recursive: true });
+function loadSession() {
   try {
-    const state = JSON.parse(readFileSync(sessionFile, "utf8"));
+    const lines = readFileSync(sessionFile, "utf8").trimEnd().split("\n");
+    const header = JSON.parse(lines[0]);
+    if (header.type === "session") sessionId = header.id;
+    const state = lines.length > 1 ? JSON.parse(lines.at(-1)) : {};
     messages = state.messages ?? [];
     lastText = state.lastText ?? null;
-    sessionId = state.sessionId ?? sessionId;
   } catch {}
-  persist();
+  publishProcessState();
 }
 
 function persist() {
-  writeFileSync(sessionFile, JSON.stringify({ sessionId, messages, lastText }));
-  writeFileSync(statePath, JSON.stringify({ pid: process.pid, toolChildPid: toolChild?.pid, sessionFile, messages, lastText }));
+  mkdirSync(dirname(sessionFile), { recursive: true });
+  const header = { type: "session", version: 3, id: sessionId, cwd };
+  const state = { type: "fake_state", messages, lastText };
+  writeFileSync(sessionFile, `${JSON.stringify(header)}\n${JSON.stringify(state)}\n`);
+  publishProcessState();
+}
+
+function publishProcessState() {
+  writeFileSync(statePath, JSON.stringify({ pid: process.pid, toolChildPid: toolChild?.pid, sessionFile, sessionId, messages, lastText }));
 }
 
 function send(value) {
@@ -59,9 +79,9 @@ function handle(command) {
       });
       break;
     case "switch_session":
-      sessionFile = command.sessionPath;
-      ensureSession();
-      appendFileSync(join(cwd, ".fake-pi-switches.log"), `${sessionFile}\n`);
+      sessionFile = resolve(command.sessionPath);
+      loadSession();
+      writeFileSync(join(cwd, ".fake-pi-switches.log"), `${sessionFile}\n`, { flag: "a" });
       response("switch_session", command.id, { cancelled: false });
       break;
     case "prompt": {
@@ -85,7 +105,7 @@ function handle(command) {
           : "setInterval(() => {}, 1000)";
         toolChild = spawn(process.execPath, ["-e", code], { stdio: "ignore" });
         leaderExitsOnTerm = command.message.includes("leader-exits-on-term");
-        persist();
+        publishProcessState();
       }
       if (command.message === "CRASH") {
         setTimeout(() => process.exit(23), delay);
@@ -129,7 +149,8 @@ function handle(command) {
   }
 }
 
-ensureSession();
+if (restorePath) loadSession();
+else publishProcessState();
 process.on("SIGTERM", () => {
   if (leaderExitsOnTerm) process.exit(0);
 });

@@ -1,4 +1,4 @@
-import { execFileSync, spawn, type ChildProcessWithoutNullStreams, type SpawnOptionsWithoutStdio } from "node:child_process";
+import { execFileSync, spawn, type ChildProcessWithoutNullStreams, type SpawnOptions } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { JsonlDecoder } from "./jsonl.js";
 import {
@@ -25,11 +25,18 @@ export interface SpawnedProcess {
 export type ProcessFactory = (
   command: string,
   args: readonly string[],
-  options: SpawnOptionsWithoutStdio,
+  options: SpawnOptions,
 ) => SpawnedProcess;
+
+export type PiStartup =
+  | { kind: "new"; sessionDirectory: string; sessionId: string }
+  | { kind: "restore"; sessionFile: string }
+  | { kind: "default" };
 
 export interface PiRpcProcessOptions {
   cwd: string;
+  startup?: PiStartup;
+  ownershipFds?: readonly number[];
   executable?: string;
   model?: string;
   commandTimeoutMs?: number;
@@ -47,7 +54,7 @@ interface PendingCommand {
 }
 
 const defaultProcessFactory: ProcessFactory = (command, args, options) =>
-  spawn(command, args, { ...options, stdio: ["pipe", "pipe", "pipe"] }) as ChildProcessWithoutNullStreams;
+  spawn(command, args, options) as ChildProcessWithoutNullStreams;
 
 class PosixProcessGroup {
   readonly #pgid: number;
@@ -162,14 +169,16 @@ export class PiRpcProcess extends EventEmitter {
     this.#terminationReason = undefined;
     this.#terminationStarted = undefined;
     this.#exitNotified = false;
-    const args = ["--mode", "rpc"];
+    const args = startupArgs(this.#options.startup ?? { kind: "default" });
     if (this.#options.model) args.push("--model", this.#options.model);
+    const stdio: Array<"pipe" | number> = ["pipe", "pipe", "pipe", ...(this.#options.ownershipFds ?? [])];
 
     const processFactory = this.#options.processFactory ?? defaultProcessFactory;
     const child = processFactory(this.#options.executable, args, {
       cwd: this.#options.cwd,
       env: process.env,
       detached: process.platform !== "win32",
+      stdio,
     });
     this.#child = child;
     if (process.platform !== "win32" && child.pid !== undefined) this.#processGroup = new PosixProcessGroup(child.pid);
@@ -414,6 +423,17 @@ export class PiRpcProcess extends EventEmitter {
     try {
       this.#child?.kill(signal);
     } catch {}
+  }
+}
+
+function startupArgs(startup: PiStartup): string[] {
+  switch (startup.kind) {
+    case "new":
+      return ["--session-dir", startup.sessionDirectory, "--session-id", startup.sessionId, "--mode", "rpc"];
+    case "restore":
+      return ["--session", startup.sessionFile, "--mode", "rpc"];
+    case "default":
+      return ["--mode", "rpc"];
   }
 }
 

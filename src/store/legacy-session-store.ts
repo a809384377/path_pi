@@ -42,6 +42,10 @@ export class LegacyJsonSessionStore {
     this.#path = path;
   }
 
+  get path(): string {
+    return this.#path;
+  }
+
   async load(): Promise<SessionManifest> {
     let content: string;
     try {

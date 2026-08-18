@@ -76,6 +76,13 @@
 
 ---
 
+## Step 3 完成: cross-MCP ownership
+- `OwnershipLockManager`使用稳定永久lock files、nonblocking kernel flock、logical→native与migration→source→logical→native顺序；lock fd通过Pi额外stdio继承，parent SIGKILL时旧Pi继续fence。
+- `PiRpcProcess`支持独占new `--session-dir/--session-id`与direct restore `--session`；SessionManager已接入v2 records、actual-native alias、crash reconciliation、admission barrier、terminal publication retry和confirmed release。
+- 验收：focused 34/34、全量80/80、pack dry-run、diff-check、无测试残留进程；独立review `794f87ca` PASS，报告见`ai/scratch/shared-session-registry-v2/step3-review.md`。
+- Step 4对接：server factory需注入`SessionRecordStore`/`OwnershipLockManager`并启动migration；status需动态list磁盘；remote current/last wait与README/config/tool error文案待完成。
+- 剩余边界：声明矩阵的跨Node/平台clean-install与真实Pi 0.84.1集成尚未完成；orphan Pi fail-closed与恶意同UID/网络文件系统仍是spec边界。
+
 ## 踩坑记录
 
 （Sprint 结束时提取。）

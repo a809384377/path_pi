@@ -49,6 +49,50 @@ async function waitFor(condition: () => boolean): Promise<void> {
   throw new Error("condition not reached");
 }
 
+test("PiRpcProcess emits exact new/restore args and inherited stdio before commands", async () => {
+  for (const [startup, expectedArgs] of [
+    [
+      { kind: "new" as const, sessionDirectory: "/tmp/exclusive", sessionId: "native-1" },
+      ["--session-dir", "/tmp/exclusive", "--session-id", "native-1", "--mode", "rpc", "--model", "provider/model"],
+    ],
+    [
+      { kind: "restore" as const, sessionFile: "/tmp/session.jsonl" },
+      ["--session", "/tmp/session.jsonl", "--mode", "rpc", "--model", "provider/model"],
+    ],
+  ] as const) {
+    const child = new FakeChild();
+    let capturedArgs: readonly string[] = [];
+    let capturedStdio: unknown;
+    const rpc = new PiRpcProcess({
+      cwd: "/tmp",
+      startup,
+      model: "provider/model",
+      ownershipFds: [41, 42],
+      processFactory: (_command, args, options) => {
+        capturedArgs = args;
+        capturedStdio = options.stdio;
+        return child;
+      },
+      commandTimeoutMs: 100,
+    });
+    const starting = rpc.start();
+    await waitFor(() => child.writes.length === 1);
+    assert.deepEqual(capturedArgs, expectedArgs);
+    assert.deepEqual(capturedStdio, ["pipe", "pipe", "pipe", 41, 42]);
+    assert.deepEqual(child.writes.map((request) => request.type), ["get_state"]);
+    child.respond(0, "get_state", {
+      sessionFile: startup.kind === "new" ? "/tmp/exclusive/session.jsonl" : "/tmp/session.jsonl",
+      sessionId: "native-1",
+      isStreaming: false,
+      isCompacting: false,
+      messageCount: 0,
+      pendingMessageCount: 0,
+    });
+    await starting;
+    await rpc.stop();
+  }
+});
+
 test("PiRpcProcess performs readiness correlation and emits events", async () => {
   const child = new FakeChild();
   const rpc = new PiRpcProcess({ cwd: "/tmp", processFactory: () => child, commandTimeoutMs: 100 });

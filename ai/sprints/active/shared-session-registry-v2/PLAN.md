@@ -18,12 +18,12 @@
 - 内容: 用独立 record 替换单一 manifest 写路径；实现并发安全的枚举、原子更新、schema/version 校验和幂等迁移
 - 验证: 两个 store 实例并发写不同 session 不覆盖；迁移中断后可重试且结果一致
 
-## Step 3: 实现跨 MCP Server 的 session ownership [wip]
+## Step 3: 实现跨 MCP Server 的 session ownership [done]
 - 涉及: ownership/lock 模块、`SessionManager`、shutdown/recovery tests
 - 内容: 每 session 单 owner；占用、续持、释放和 stale recovery；恢复前确认 ownership；状态查询不抢锁
 - 验证: 两进程竞争同 session 只有一个成功；正常退出后可接手；异常 owner 不会造成自动双写
 
-## Step 4: 接入统一默认目录并保持五工具 API [ ]
+## Step 4: 接入统一默认目录并保持五工具 API [wip]
 - 涉及: `src/server.ts`、MCP schemas、README、配置示例
 - 内容: Claude/Codex 共用默认目录，不再要求调用方拆分目录；保留 spawn/send/wait/status/close 契约并补充 `session_in_use` 说明
 - 验证: 两个真实 stdio MCP Server 在同一临时 root 下并行使用不同 session；接手流程通过
