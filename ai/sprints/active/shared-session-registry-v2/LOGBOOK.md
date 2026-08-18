@@ -65,6 +65,17 @@
 
 ---
 
+## 执行进度
+
+### Step 2 完成: per-session store 与 v1 migration
+- `SessionRecordStore`提供atomic no-replace create、expected revision update、动态list与drain；strict Pi header与secure-fs统一执行first-line identity、private mode和component symlink检查。
+- `V1SessionMigrator`提供canonical-root discovery、dirty attestation、source-atomic unique quarantine、durable intent/receipt resume与immutable descendant acceptance。
+- Step 3对接接口：`MigrationCandidateLockCoordinator.withCandidateLocks`、`orderedMigrationCandidates`（migration→source→logical→native）、`readPiSessionIdentity`；production coordinator需把candidate作为ordered set去重。
+- 验收：typecheck、focused 39/39、全量74/74；独立review `cffea40d` PASS，完整报告与处置见`ai/scratch/shared-session-registry-v2/step2-review.md`。
+- 剩余边界：真实flock、fd inheritance、runtime ownership与release ordering归Step 3；physical power-loss与恶意同UID进程不在验证范围。
+
+---
+
 ## 踩坑记录
 
 （Sprint 结束时提取。）

@@ -13,12 +13,12 @@
 - 内容: 确定统一目录布局、session ID、per-session record 原子写、锁原语、owner 身份、正常释放、stale 判定、dirty session 行为、list/status 聚合和 v1 迁移
 - 验证: 独立 reviewer 无未处理架构 Blocker；用户确认 spec 后冻结提交
 
-## Step 2: 实现 per-session record store 与 v1 迁移 [wip]
+## Step 2: 实现 per-session record store 与 v1 迁移 [done]
 - 涉及: `src/store/`、store/migration tests
 - 内容: 用独立 record 替换单一 manifest 写路径；实现并发安全的枚举、原子更新、schema/version 校验和幂等迁移
 - 验证: 两个 store 实例并发写不同 session 不覆盖；迁移中断后可重试且结果一致
 
-## Step 3: 实现跨 MCP Server 的 session ownership [ ]
+## Step 3: 实现跨 MCP Server 的 session ownership [wip]
 - 涉及: ownership/lock 模块、`SessionManager`、shutdown/recovery tests
 - 内容: 每 session 单 owner；占用、续持、释放和 stale recovery；恢复前确认 ownership；状态查询不抢锁
 - 验证: 两进程竞争同 session 只有一个成功；正常退出后可接手；异常 owner 不会造成自动双写
