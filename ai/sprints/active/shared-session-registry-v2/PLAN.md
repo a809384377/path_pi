@@ -8,12 +8,12 @@
 - 运行形态: 交互式；Step 1 为设计检查点，涉及进程所有权的实现与测试由单一 writer 执行
 - 危险操作归属: 仅使用临时状态目录和 fake Pi；不触碰用户真实 `~/.pi` session 数据
 
-## Step 1: 冻结共享 session registry v2 设计 [检查点] [wip]
+## Step 1: 冻结共享 session registry v2 设计 [检查点] [done]
 - 涉及: 新 v2 spec、Codex/Pi 持久化证据、ownership 与迁移契约
 - 内容: 确定统一目录布局、session ID、per-session record 原子写、锁原语、owner 身份、正常释放、stale 判定、dirty session 行为、list/status 聚合和 v1 迁移
 - 验证: 独立 reviewer 无未处理架构 Blocker；用户确认 spec 后冻结提交
 
-## Step 2: 实现 per-session record store 与 v1 迁移 [ ]
+## Step 2: 实现 per-session record store 与 v1 迁移 [wip]
 - 涉及: `src/store/`、store/migration tests
 - 内容: 用独立 record 替换单一 manifest 写路径；实现并发安全的枚举、原子更新、schema/version 校验和幂等迁移
 - 验证: 两个 store 实例并发写不同 session 不覆盖；迁移中断后可重试且结果一致
