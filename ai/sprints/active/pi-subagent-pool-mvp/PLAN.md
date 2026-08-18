@@ -7,7 +7,7 @@
 - 运行形态: 交互式；子进程启动/终止和 integration test 由实现 worker 或主会话执行
 - 危险操作归属: 不触碰生产数据；进程清理由实现 worker和主会话负责
 
-## Step 1: 搭建 TypeScript/MCP 项目骨架 [ ]
+## Step 1: 搭建 TypeScript/MCP 项目骨架 [wip]
 - 涉及: `package.json`、`tsconfig.json`、`src/index.ts`、测试配置
 - 内容: 固定 Node/TypeScript/MCP SDK 基线、命令入口、构建和测试脚本
 - 验证: 依赖安装成功，空骨架 build/typecheck 通过
