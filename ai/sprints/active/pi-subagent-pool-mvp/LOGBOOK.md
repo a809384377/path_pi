@@ -25,6 +25,8 @@
 - 主会话验收命令 `npm run typecheck`、`npm test`、`npm pack --dry-run` 全部 exit 0；当前 18 tests pass。
 - Step 5 第一轮独立审查原文：`ai/scratch/pi-subagent-pool-mvp/review-lifecycle.md`、`ai/scratch/pi-subagent-pool-mvp/review-api-test.md`。
 - 处置: 修复全部 spec 内 Blocker/Major；补 prepack 与 LICENSE；Windows process-tree 不在 MVP 扩展实现，明确限定 macOS/Linux；修复后进行 focused re-review。
+- Step 5 第二轮 focused review 原文：`ai/scratch/pi-subagent-pool-mvp/review2-termination.md`、`ai/scratch/pi-subagent-pool-mvp/review2-api.md`。
+- 第二轮处置: shutdown 改为等待全部 cleanup 后聚合失败；close 保持 lifecycle ownership；POSIX 以 process group 消失而非 leader exit 作为清理完成；persistence failure 仍执行 process cleanup 且 wait 明确报错；补齐 finalizing 文档与 E2E 清理稳健性。
 
 ---
 
