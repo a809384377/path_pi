@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { existsSync, lstatSync } from "node:fs";
 import { lstat, readdir, realpath, rename } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -181,7 +181,7 @@ export class V1SessionMigrator {
     }
     const createdAt = this.#now();
     const converted = await this.#convertManifest(manifest, canonicalSource, sourceHash, migrationId, createdAt);
-    const quarantinePath = join(dirname(canonicalSource), `sessions.v1.quarantine-${migrationId}-${randomUUID()}.json`);
+    const quarantinePath = join(dirname(canonicalSource), `sessions.v1.retired-${sourceHash}.json`);
     const intent: MigrationIntentV1 = {
       version: 1,
       migrationId,
@@ -609,7 +609,14 @@ function validateIntent(value: unknown, transactionDirectory: string): Migration
   if (!isHash(value.sourceHash) || migrationIdentifier(value.sourcePath, value.sourceHash) !== value.migrationId || basename(transactionDirectory) !== `v1-${value.migrationId}` || !isAbsolute(value.sourcePath) || !isAbsolute(value.quarantinePath)) {
     throw new Error(`migration_intent_invalid: ${value.migrationId}`);
   }
-  if (dirname(value.quarantinePath) !== dirname(value.sourcePath) || !basename(value.quarantinePath).startsWith(`sessions.v1.quarantine-${value.migrationId}-`)) throw new Error(`migration_intent_invalid: ${value.migrationId}`);
+  const retiredName = `sessions.v1.retired-${value.sourceHash}.json`;
+  const legacyQuarantinePrefix = `sessions.v1.quarantine-${value.migrationId}-`;
+  if (
+    dirname(value.quarantinePath) !== dirname(value.sourcePath) ||
+    basename(value.quarantinePath) !== retiredName && !basename(value.quarantinePath).startsWith(legacyQuarantinePrefix)
+  ) {
+    throw new Error(`migration_intent_invalid: ${value.migrationId}`);
+  }
   if (!Array.isArray(value.records) || !isRecord(value.recordPayloadHashes) || !isRecord(value.identitySnapshots) || !Array.isArray(value.publishedSessionIds) || typeof value.createdAt !== "string" || !Number.isFinite(Date.parse(value.createdAt))) throw new Error(`migration_intent_invalid: ${value.migrationId}`);
   if (!["staged", "ready_to_retire", "retired", "publishing", "quarantined_mismatch"].includes(String(value.status))) throw new Error(`migration_intent_invalid: ${value.migrationId}`);
   const records = value.records.map(validateSessionRecord);

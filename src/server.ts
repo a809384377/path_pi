@@ -1,32 +1,92 @@
+import { lstat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { FlockMigrationCandidateLockCoordinator, OwnershipLockManager } from "./ownership/session-ownership.js";
 import { SessionManager } from "./session/session-manager.js";
-import { JsonSessionStore } from "./store/session-store.js";
+import { ensurePrivateDirectory } from "./store/secure-fs.js";
+import { SessionRecordStore } from "./store/session-store.js";
+import {
+  V1SessionMigrator,
+  automaticMigrationEnabled,
+  canonicalDefaultStateRoot,
+  discoverLegacySources,
+  type MigrationOutcome,
+} from "./store/v1-migration.js";
 
 export interface ServerRuntime {
   server: McpServer;
   manager: SessionManager;
+  stateRoot: string;
+  migrationOutcomes: MigrationOutcome[];
 }
 
-export async function createServerRuntime(env: NodeJS.ProcessEnv = process.env): Promise<ServerRuntime> {
-  const stateDirectory = env.PI_AGENT_MCP_STATE_DIR ?? join(homedir(), ".pi", "agent-mcp");
-  const store = new JsonSessionStore(join(stateDirectory, "sessions.json"));
-  const manager = new SessionManager({
-    store,
+export interface ServerConfiguration {
+  stateRoot: string;
+  canonical: boolean;
+  executable?: string;
+  maxSessions: number;
+  commandTimeoutMs: number;
+  shutdownGraceMs: number;
+  importDirty: boolean;
+}
+
+export function resolveServerConfiguration(
+  env: NodeJS.ProcessEnv = process.env,
+  home: string = homedir(),
+): ServerConfiguration {
+  const explicitRoot = env.PI_AGENT_MCP_STATE_DIR;
+  const stateRoot = resolve(explicitRoot ?? canonicalDefaultStateRoot(home));
+  if (explicitRoot !== undefined && knownLegacyRoots(home).includes(stateRoot)) {
+    throw new Error(
+      "legacy_state_uncertain: caller-specific legacy state root configured; stop all old clients, remove PI_AGENT_MCP_STATE_DIR, then start one canonical v2 client",
+    );
+  }
+  return {
+    stateRoot,
+    canonical: automaticMigrationEnabled(stateRoot, env, home),
     ...(env.PI_AGENT_MCP_PI_EXECUTABLE ? { executable: env.PI_AGENT_MCP_PI_EXECUTABLE } : {}),
     maxSessions: parsePositiveInteger(env.PI_AGENT_MCP_MAX_SESSIONS, 16),
     commandTimeoutMs: parsePositiveInteger(env.PI_AGENT_MCP_COMMAND_TIMEOUT_MS, 30_000),
     shutdownGraceMs: parsePositiveInteger(env.PI_AGENT_MCP_SHUTDOWN_GRACE_MS, 1_000),
+    importDirty: env.PI_AGENT_MCP_IMPORT_DIRTY === "1",
+  };
+}
+
+export async function createServerRuntime(
+  env: NodeJS.ProcessEnv = process.env,
+  home: string = homedir(),
+): Promise<ServerRuntime> {
+  const configuration = resolveServerConfiguration(env, home);
+  await ensureRegistryDirectories(configuration.stateRoot);
+  const store = new SessionRecordStore(configuration.stateRoot);
+  const ownership = new OwnershipLockManager(configuration.stateRoot);
+  await ownership.initialize();
+  const migrator = new V1SessionMigrator({
+    root: configuration.stateRoot,
+    recordStore: store,
+    coordinator: new FlockMigrationCandidateLockCoordinator(ownership),
+    allowDirty: configuration.importDirty,
+  });
+  const migrationOutcomes = configuration.canonical
+    ? await runCanonicalMigrations(migrator, discoverLegacySources(env, home))
+    : [];
+  const manager = new SessionManager({
+    store,
+    ownership,
+    ...(configuration.executable ? { executable: configuration.executable } : {}),
+    maxSessions: configuration.maxSessions,
+    commandTimeoutMs: configuration.commandTimeoutMs,
+    shutdownGraceMs: configuration.shutdownGraceMs,
     logger: (message) => process.stderr.write(`[pi] ${message}`),
   });
   await manager.initialize();
 
   const server = new McpServer({ name: "pi-agent-mcp", version: "0.1.0" });
   registerTools(server, manager);
-  return { server, manager };
+  return { server, manager, stateRoot: configuration.stateRoot, migrationOutcomes };
 }
 
 export function registerTools(server: McpServer, manager: SessionManager): void {
@@ -91,7 +151,7 @@ export function registerTools(server: McpServer, manager: SessionManager): void 
       },
     },
     async ({ session_id }) =>
-      toolResult(() => Promise.resolve(session_id === undefined ? manager.status() : manager.status(session_id))),
+      toolResult(async () => session_id === undefined ? await manager.status() : await manager.status(session_id)),
   );
 
   server.registerTool(
@@ -147,10 +207,79 @@ async function toolResult<T>(operation: () => Promise<T>): Promise<{
     return { content: [{ type: "text", text: JSON.stringify(value, null, 2) }] };
   } catch (error) {
     return {
-      content: [{ type: "text", text: JSON.stringify({ error: errorMessage(error) }, null, 2) }],
+      content: [{ type: "text", text: JSON.stringify({ error: publicErrorMessage(error) }, null, 2) }],
       isError: true,
     };
   }
+}
+
+async function ensureRegistryDirectories(root: string): Promise<void> {
+  await ensurePrivateDirectory(root);
+  for (const directory of ["sessions", "pi-sessions", "locks", "migrations", "tmp"]) {
+    await ensurePrivateDirectory(join(root, directory));
+  }
+}
+
+async function runCanonicalMigrations(
+  migrator: V1SessionMigrator,
+  sources: readonly string[],
+): Promise<MigrationOutcome[]> {
+  const outcomes = await migrator.resumeIncomplete();
+  for (const source of sources) {
+    if (!(await pathExists(source))) continue;
+    const outcome = await migrator.migrateSource(source);
+    if (outcome.status === "conflict") {
+      throw new Error("migration_conflict: legacy source conflicts with the shared registry; inspect the migration conflicts artifact");
+    }
+    outcomes.push(outcome);
+  }
+  return outcomes;
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+export function publicErrorMessage(error: unknown): string {
+  const message = errorMessage(error);
+  const code = message.match(/^(session_in_use|native_session_in_use|migration_blocked|migration_conflict|legacy_state_uncertain|ownership_unavailable):?/)?.[1];
+  if (code) return code;
+  if (message.startsWith("migration_")) return "migration_blocked";
+  if (message.startsWith("ownership_")) return "ownership_unavailable";
+  return message;
+}
+
+export function startupErrorMessage(error: unknown): string {
+  const raw = errorMessage(error);
+  if (raw.includes("caller-specific legacy state root configured")) {
+    return "legacy_state_uncertain: stop all old clients, remove PI_AGENT_MCP_STATE_DIR from their configuration, start one canonical v2 client, check migration receipts, then start other clients";
+  }
+  switch (publicErrorMessage(error)) {
+    case "ownership_unavailable":
+      return "ownership_unavailable: kernel ownership requires macOS/Linux x64/arm64, Node >=22.19 <26, and the pinned flock dependency";
+    case "legacy_state_uncertain":
+      return "legacy_state_uncertain: stop legacy MCP clients and Pi processes, then retry one canonical startup with PI_AGENT_MCP_IMPORT_DIRTY=1";
+    case "migration_conflict":
+      return "migration_conflict: legacy records remain unretired; inspect the canonical migrations conflict artifact";
+    case "migration_blocked":
+      return "migration_blocked: another migration currently owns the source; stop duplicate migration hosts or retry later";
+    case "session_in_use":
+      return "session_in_use: another compliant host or inherited Pi process owns the session";
+    case "native_session_in_use":
+      return "native_session_in_use: another logical record owns the native Pi session";
+    default:
+      return errorMessage(error);
+  }
+}
+
+function knownLegacyRoots(home: string): string[] {
+  return [join(home, ".pi", "agent-mcp-claude"), join(home, ".pi", "agent-mcp-codex")].map((path) => resolve(path));
 }
 
 function parsePositiveInteger(value: string | undefined, fallback: number): number {

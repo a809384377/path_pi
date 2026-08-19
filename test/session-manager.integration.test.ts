@@ -5,7 +5,7 @@ import { mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
-import { OwnershipLockManager } from "../src/ownership/session-ownership.js";
+import { OwnershipLockManager, SessionOwnership } from "../src/ownership/session-ownership.js";
 import { PiRpcProcess, type PiRpcProcessOptions } from "../src/rpc/pi-rpc-process.js";
 import type { PiSessionState } from "../src/rpc/types.js";
 import { SessionManager } from "../src/session/session-manager.js";
@@ -138,6 +138,7 @@ class GatedReadStore extends SessionRecordStore {
 
 class GatedUpdateStore extends SessionRecordStore {
   updateGate: DeferredGate | undefined;
+  drainGate: DeferredGate | undefined;
   override async updateOwned(...args: Parameters<SessionRecordStore["updateOwned"]>): Promise<void> {
     const gate = this.updateGate;
     if (gate) {
@@ -145,6 +146,14 @@ class GatedUpdateStore extends SessionRecordStore {
       await gate.block();
     }
     return super.updateOwned(...args);
+  }
+  override async drain(...args: Parameters<SessionRecordStore["drain"]>): Promise<void> {
+    const gate = this.drainGate;
+    if (gate) {
+      this.drainGate = undefined;
+      await gate.block();
+    }
+    return super.drain(...args);
   }
 }
 
@@ -157,6 +166,19 @@ class GatedOwnershipLockManager extends OwnershipLockManager {
       await gate.block();
     }
     return super.acquireSession(...args);
+  }
+}
+
+class GatedSessionReleaseLockManager extends OwnershipLockManager {
+  releaseGate: DeferredGate | undefined;
+  override async acquireSession(...args: Parameters<OwnershipLockManager["acquireSession"]>) {
+    const ownership = await super.acquireSession(...args);
+    const gate = this.releaseGate;
+    if (!gate) return ownership;
+    this.releaseGate = undefined;
+    return new SessionOwnership(ownership.logical, ownership.native, {
+      afterNativeClose: () => gate.block(),
+    });
   }
 }
 
@@ -181,6 +203,20 @@ class UnconfirmedExitRpc extends ControlledRpc {
   confirmExit(): void {
     this.owned = false;
     this.emit("exit", new Error("late confirmed exit"));
+  }
+}
+
+class RejectingPromptDelayedStopRpc extends ControlledRpc {
+  readonly stopGate = new DeferredGate();
+  override async prompt(): Promise<void> {
+    this.promptCount += 1;
+    await mkdir(dirname(this.sessionFile), { recursive: true });
+    await writeFile(this.sessionFile, `${JSON.stringify({ type: "session", version: 3, id: this.sessionId, cwd: this.options.cwd })}\n`);
+    throw new Error("prompt rejected for close race");
+  }
+  override async stop(): Promise<void> {
+    await this.stopGate.block();
+    this.owned = false;
   }
 }
 
@@ -213,6 +249,7 @@ async function createManager(
     rpcFactory?: (options: PiRpcProcessOptions) => PiRpcProcess;
     idFactory?: () => string;
     nativeIdFactory?: () => string;
+    recordIdentityValidator?: (record: SessionRecordV2) => Promise<boolean>;
   } = {},
 ): Promise<SessionManager> {
   let sequence = 0;
@@ -225,6 +262,7 @@ async function createManager(
     ...(options.commandTimeoutMs ? { commandTimeoutMs: options.commandTimeoutMs } : {}),
     ...(options.shutdownGraceMs ? { shutdownGraceMs: options.shutdownGraceMs } : {}),
     ...(options.rpcFactory ? { rpcFactory: options.rpcFactory } : {}),
+    ...(options.recordIdentityValidator ? { recordIdentityValidator: options.recordIdentityValidator } : {}),
   });
   await manager.initialize();
   return manager;
@@ -312,7 +350,7 @@ test("shutdown waits a blocked spawn ownership admission and then cleans it", as
   await spawning;
   await shuttingDown;
   assert.equal(rpc!.processOwned, false);
-  assert.deepEqual([...manager.status()].filter((value) => value.resident), []);
+  assert.deepEqual((await manager.status()).filter((value) => value.resident === true), []);
 });
 
 test("restore rejects same-header inode replacement performed by rpcFactory before launch", async () => {
@@ -547,20 +585,80 @@ test("close during delayed startup cancels prompt and releases only after confir
   const spawning = h.manager.spawn({ task: "work", cwd: h.cwd });
   while (!rpc) await new Promise((resolve) => setTimeout(resolve, 1));
   await rpc.entered;
-  const sessionId = h.manager.status()[0]!.session_id;
+  const sessionId = (await h.manager.status())[0]!.session_id;
   const closing = h.manager.close(sessionId);
   rpc.release();
   await assert.rejects(spawning, /task_cancelled|session_file_exists|failed/);
   await closing;
   assert.equal(rpc.promptCount, 0);
-  assert.equal(h.manager.status(sessionId).state, "closed");
+  assert.equal((await h.manager.status(sessionId)).state, "closed");
   await h.manager.shutdown();
+});
+
+test("unexpected idle exit cannot resurrect a concurrently closed session", async () => {
+  const identityGate = new DeferredGate();
+  let rpc: ControlledRpc | undefined;
+  const h = await harness({
+    rpcFactory: (options) => (rpc = new ControlledRpc(options)),
+    recordIdentityValidator: async (record) => {
+      if (record.state === "idle") {
+        await identityGate.block();
+      }
+      return true;
+    },
+  });
+  const spawned = await h.manager.spawn({ task: "work", cwd: h.cwd });
+  await waitTerminal(h.manager, spawned.task_id);
+  rpc!.owned = false;
+  rpc!.emit("exit", new Error("unexpected exit"));
+  await identityGate.entered;
+  const closing = h.manager.close(spawned.session_id);
+  identityGate.release();
+  const closed = await closing;
+  assert.equal(closed.state, "closed");
+  assert.equal((await h.store.read(spawned.session_id)).state, "closed");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal((await h.store.read(spawned.session_id)).state, "closed");
+  await h.manager.shutdown();
+});
+
+test("dispatch failure joins concurrent close and retains ownership through durable close", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-manager-dispatch-close-"));
+  const root = join(cwd, "state");
+  const store = new GatedUpdateStore(root);
+  let rpc: RejectingPromptDelayedStopRpc | undefined;
+  const manager = await createManager(store, new OwnershipLockManager(root), {
+    rpcFactory: (options) => (rpc = new RejectingPromptDelayedStopRpc(options)),
+  });
+  const spawning = manager.spawn({ task: "work", cwd });
+  const spawnOutcome = spawning.then(
+    () => ({ error: undefined }),
+    (error: unknown) => ({ error }),
+  );
+  while (!rpc) await new Promise((resolve) => setImmediate(resolve));
+  await rpc.stopGate.entered;
+  const sessionId = (await store.list())[0]!.sessionId;
+  const updateGate = new DeferredGate();
+  store.updateGate = updateGate;
+  const closing = manager.close(sessionId);
+  rpc.stopGate.release();
+  await updateGate.entered;
+  const contender = new OwnershipLockManager(root);
+  await assert.rejects(contender.acquire("logical", sessionId), /session_in_use/);
+  updateGate.release();
+  const outcome = await spawnOutcome;
+  assert.match(String(outcome.error), /prompt rejected for close race/);
+  assert.equal((await closing).state, "closed");
+  assert.equal((await store.read(sessionId)).state, "closed");
+  const acquired = await contender.acquire("logical", sessionId);
+  await acquired.close();
+  await manager.shutdown();
 });
 
 test("settled-before-rejected-prompt never publishes completion", async () => {
   const h = await harness({ rpcFactory: (options) => new SettledThenRejectedRpc(options) });
   await assert.rejects(h.manager.spawn({ task: "work", cwd: h.cwd }), /prompt rejected/);
-  const status = h.manager.status()[0]!;
+  const status = (await h.manager.status())[0]!;
   assert.equal(status.last_task?.status, "failed");
   assert.doesNotMatch(status.last_task?.error ?? "", /completed/);
   await h.manager.shutdown();
@@ -735,8 +833,450 @@ test("status is observational and does not acquire remote ownership", async () =
   const sessionId = "pi_status_only";
   await h.store.create(record(h.root, sessionId, { recoverable: false, state: "error" }));
   const manager = await createManager(h.store, new OwnershipLockManager(h.root));
-  assert.equal(manager.status(sessionId).resident, false);
+  const observed = await manager.status(sessionId);
+  assert.equal(observed.resident, "unknown");
+  assert.equal(observed.ownership, "free_or_unknown");
   const handle = await new OwnershipLockManager(h.root).acquire("logical", sessionId);
   await handle.close();
   await manager.shutdown();
+});
+
+test("free error record without native identity closes under logical ownership", async () => {
+  const h = await harness();
+  const sessionId = "pi_identityless_error";
+  await h.store.create({
+    version: 2,
+    sessionId,
+    revision: 1,
+    generation: 1,
+    cwd: h.cwd,
+    state: "error",
+    recoverable: false,
+    activeTaskId: null,
+    updatedAt: now,
+  });
+  const manager = await createManager(h.store, new OwnershipLockManager(h.root));
+  assert.equal((await manager.close(sessionId)).state, "closed");
+  assert.equal((await h.store.read(sessionId)).state, "closed");
+  await manager.shutdown();
+});
+
+test("remote close preserves native fencing whenever identity exists", async () => {
+  const h = await harness();
+  const sessionId = "pi_error_with_identity";
+  const sessionFile = join(h.cwd, "error-with-identity.jsonl");
+  await writePiFile(sessionFile, "native-controlled", h.cwd);
+  await h.store.create(record(h.root, sessionId, {
+    sessionFile,
+    state: "error",
+    recoverable: false,
+  }));
+  const native = await new OwnershipLockManager(h.root).acquire("native", "native-controlled");
+  const manager = await createManager(h.store, new OwnershipLockManager(h.root));
+  await assert.rejects(manager.close(sessionId), /native_session_in_use/);
+  assert.equal((await h.store.read(sessionId)).state, "error");
+  await native.close();
+  assert.equal((await manager.close(sessionId)).state, "closed");
+  await manager.shutdown();
+});
+
+test("remote wait polls fixed target records and ignores unrelated corruption", async () => {
+  const h = await harness();
+  const first = "pi_wait_first";
+  const second = "pi_wait_second";
+  await h.store.create({
+    version: 2,
+    sessionId: first,
+    revision: 1,
+    generation: 1,
+    cwd: h.cwd,
+    state: "running",
+    recoverable: false,
+    piSessionId: "native-wait-first",
+    activeTaskId: "task_wait_first",
+    updatedAt: now,
+  });
+  await h.store.create({
+    version: 2,
+    sessionId: second,
+    revision: 1,
+    generation: 1,
+    cwd: h.cwd,
+    state: "running",
+    recoverable: false,
+    piSessionId: "native-wait-second",
+    activeTaskId: "task_wait_second",
+    updatedAt: now,
+  });
+  const corruptPath = join(h.store.sessionsDirectory, `${sessionRecordHash("pi_unrelated_corrupt")}.json`);
+  await writeFile(corruptPath, "{broken", { mode: 0o600 });
+  const manager = await createManager(h.store, new OwnershipLockManager(h.root));
+  const result = await manager.wait(["task_wait_first", "task_wait_second"], "all", 1_000);
+  assert.deepEqual(result.completed.map((task) => task.task_id).sort(), ["task_wait_first", "task_wait_second"]);
+  assert.ok(result.completed.every((task) => task.status === "host_interrupted"));
+  await manager.shutdown();
+});
+
+test("close during fail-dispatch terminal publication retains ownership until closed commit", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-manager-close-publication-"));
+  const root = join(cwd, "state");
+  const store = new GatedUpdateStore(root);
+  const promptGate = new DeferredGate();
+  class GatedRejectingRpc extends ControlledRpc {
+    override async prompt(): Promise<void> {
+      this.promptCount += 1;
+      await mkdir(dirname(this.sessionFile), { recursive: true });
+      await writeFile(this.sessionFile, `${JSON.stringify({ type: "session", version: 3, id: this.sessionId, cwd: this.options.cwd })}\n`);
+      await promptGate.block();
+      throw new Error("publication race rejection");
+    }
+  }
+  const manager = await createManager(store, new OwnershipLockManager(root), {
+    rpcFactory: (options) => new GatedRejectingRpc(options),
+  });
+  const spawning = manager.spawn({ task: "work", cwd });
+  await promptGate.entered;
+  const sessionId = (await store.list())[0]!.sessionId;
+  const publicationGate = new DeferredGate();
+  store.updateGate = publicationGate;
+  promptGate.release();
+  await publicationGate.entered;
+  const closing = manager.close(sessionId);
+  const contender = new OwnershipLockManager(root);
+  await assert.rejects(contender.acquire("logical", sessionId), /session_in_use/);
+  publicationGate.release();
+  await assert.rejects(spawning, /publication race rejection/);
+  assert.equal((await closing).state, "closed");
+  assert.equal((await store.read(sessionId)).state, "closed");
+  const acquired = await contender.acquire("logical", sessionId);
+  await acquired.close();
+  await manager.shutdown();
+});
+
+test("close immediately before fail-dispatch release preserves ownership for cleanup", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-manager-close-release-"));
+  const root = join(cwd, "state");
+  const store = new GatedUpdateStore(root);
+  class RejectingRpc extends ControlledRpc {
+    override async prompt(): Promise<void> { throw new Error("release race rejection"); }
+  }
+  const manager = await createManager(store, new OwnershipLockManager(root), {
+    rpcFactory: (options) => new RejectingRpc(options),
+  });
+  const releaseGate = new DeferredGate();
+  store.drainGate = releaseGate;
+  const spawning = manager.spawn({ task: "work", cwd });
+  await releaseGate.entered;
+  const sessionId = (await store.list())[0]!.sessionId;
+  const closing = manager.close(sessionId);
+  const contender = new OwnershipLockManager(root);
+  await assert.rejects(contender.acquire("logical", sessionId), /session_in_use/);
+  releaseGate.release();
+  await assert.rejects(spawning, /release race rejection/);
+  assert.equal((await closing).state, "closed");
+  assert.equal((await store.read(sessionId)).state, "closed");
+  await manager.shutdown();
+});
+
+test("remote wait reconciliation and same-manager close share lifecycle ownership", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-manager-wait-close-lifecycle-"));
+  const root = join(cwd, "state");
+  const store = new GatedUpdateStore(root);
+  const sessionId = "pi_wait_close";
+  const sessionFile = join(cwd, "wait-close.jsonl");
+  await writePiFile(sessionFile, "native-wait-close", cwd);
+  await store.create(record(root, sessionId, {
+    piSessionId: "native-wait-close",
+    sessionFile,
+    state: "running",
+    activeTaskId: "task_wait_close",
+  }));
+  const manager = await createManager(store, new OwnershipLockManager(root));
+  const reconcileGate = new DeferredGate();
+  store.updateGate = reconcileGate;
+  const waiting = manager.wait(["task_wait_close"], "all", 1_000);
+  await reconcileGate.entered;
+  const closing = manager.close(sessionId);
+  const contender = new OwnershipLockManager(root);
+  await assert.rejects(contender.acquire("logical", sessionId), /session_in_use/);
+  reconcileGate.release();
+  assert.equal((await closing).state, "closed");
+  const waited = await waiting;
+  assert.equal(waited.completed[0]?.task_id, "task_wait_close");
+  assert.equal((await store.read(sessionId)).state, "closed");
+  const acquired = await contender.acquire("logical", sessionId);
+  await acquired.close();
+  await manager.shutdown();
+});
+
+test("remote wait rejects a task overwritten after discovery without mutating its successor", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-manager-wait-overwrite-"));
+  const root = join(cwd, "state");
+  const discoveryGate = new DeferredGate();
+  class GatedDiscoveryStore extends SessionRecordStore {
+    override async findTaskRecords(...args: Parameters<SessionRecordStore["findTaskRecords"]>) {
+      const found = await super.findTaskRecords(...args);
+      await discoveryGate.block();
+      return found;
+    }
+  }
+  const store = new GatedDiscoveryStore(root);
+  const sessionId = "pi_wait_overwrite";
+  await store.create({
+    version: 2,
+    sessionId,
+    revision: 1,
+    generation: 1,
+    cwd,
+    piSessionId: "native-wait-overwrite",
+    state: "running",
+    recoverable: false,
+    activeTaskId: "task_obsolete",
+    updatedAt: now,
+  });
+  const manager = await createManager(store, new OwnershipLockManager(root));
+  const waiting = manager.wait(["task_obsolete"], "all", 1_000);
+  await discoveryGate.entered;
+  const writer = new SessionRecordStore(root);
+  const initial = await writer.read(sessionId);
+  const successor = { ...initial, revision: 2, generation: 2, activeTaskId: "task_successor" };
+  await writer.updateOwned(sessionId, 1, successor);
+  discoveryGate.release();
+  await assert.rejects(waiting, /unknown_task: task_obsolete/);
+  assert.deepEqual(await writer.read(sessionId), successor);
+  await manager.shutdown();
+});
+
+test("stale non-owned local task mapping cannot authorize remote wait reconciliation", async () => {
+  let rpc: ControlledRpc | undefined;
+  const h = await harness({ rpcFactory: (options) => (rpc = new ControlledRpc(options)) });
+  const spawned = await h.manager.spawn({ task: "old", cwd: h.cwd });
+  await waitTerminal(h.manager, spawned.task_id);
+  await h.manager.shutdown();
+  const writer = new SessionRecordStore(h.root);
+  const dormant = await writer.read(spawned.session_id);
+  const { lastTask: _obsoleteLastTask, ...withoutLastTask } = dormant;
+  const successor = {
+    ...withoutLastTask,
+    revision: dormant.revision + 1,
+    generation: dormant.generation + 1,
+    state: "running" as const,
+    activeTaskId: "task_new_remote",
+    updatedAt: new Date().toISOString(),
+  };
+  await writer.updateOwned(spawned.session_id, dormant.revision, successor);
+  await assert.rejects(h.manager.wait([spawned.task_id], "all", 100), /unknown_task/);
+  assert.deepEqual(await writer.read(spawned.session_id), successor);
+  assert.equal(rpc!.processOwned, false);
+});
+
+test("mixed local and remote waits preserve any and all semantics", async () => {
+  let rpc: ControlledRpc | undefined;
+  const h = await harness({ rpcFactory: (options) => {
+    rpc = new ControlledRpc(options);
+    rpc.autoSettle = false;
+    return rpc;
+  } });
+  const local = await h.manager.spawn({ task: "local", cwd: h.cwd });
+  const remoteSession = "pi_mixed_remote";
+  await h.store.create({
+    version: 2,
+    sessionId: remoteSession,
+    revision: 1,
+    generation: 1,
+    cwd: h.cwd,
+    state: "error",
+    recoverable: false,
+    activeTaskId: null,
+    lastTask: {
+      taskId: "task_mixed_remote",
+      sessionId: remoteSession,
+      status: "completed",
+      response: "remote",
+      completedAt: now,
+    },
+    updatedAt: now,
+  });
+  const any = await h.manager.wait([local.task_id, "task_mixed_remote"], "any", 0);
+  assert.deepEqual(any.completed.map((task) => task.task_id), ["task_mixed_remote"]);
+  assert.deepEqual(any.pending, [local.task_id]);
+  rpc!.emit("event", { type: "agent_settled" });
+  const all = await h.manager.wait([local.task_id, "task_mixed_remote"], "all", 1_000);
+  assert.deepEqual(all.completed.map((task) => task.task_id).sort(), [local.task_id, "task_mixed_remote"].sort());
+  assert.deepEqual(all.pending, []);
+  await h.manager.shutdown();
+});
+
+test("manager adopts an uncertain published revision before cleanup retry", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-manager-uncertain-update-"));
+  const root = join(cwd, "state");
+  let armed = false;
+  let publishFailures = 1;
+  let reconciliationFailures = 1;
+  const store = new SessionRecordStore(root, {
+    updateHooks: { afterPublish: () => { if (armed && publishFailures-- > 0) throw new Error("terminal publication fsync failed"); } },
+    reconciliationSyncHook: () => { if (armed && reconciliationFailures-- > 0) throw new Error("terminal reconciliation fsync failed"); },
+  });
+  let rpc: ControlledRpc | undefined;
+  const manager = await createManager(store, new OwnershipLockManager(root), {
+    rpcFactory: (options) => {
+      rpc = new ControlledRpc(options);
+      rpc.autoSettle = false;
+      return rpc;
+    },
+  });
+  const spawned = await manager.spawn({ task: "work", cwd });
+  armed = true;
+  const waiting = manager.wait([spawned.task_id], "all", 1_000);
+  rpc!.emit("event", { type: "agent_settled" });
+  await assert.rejects(waiting, /persistence_error.*record_durability_uncertain/);
+  const uncertain = await store.read(spawned.session_id);
+  assert.equal(uncertain.lastTask?.taskId, spawned.task_id);
+  const contender = new OwnershipLockManager(root);
+  await assert.rejects(contender.acquire("logical", spawned.session_id), /session_in_use/);
+  await manager.shutdown();
+  const durable = await store.read(spawned.session_id);
+  assert.equal(durable.lastTask?.taskId, spawned.task_id);
+  assert.equal(durable.state, "dormant");
+  const acquired = await contender.acquire("logical", spawned.session_id);
+  await acquired.close();
+});
+
+test("close immediately before idle-exit release preserves ownership for cleanup", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-manager-exit-close-release-"));
+  const root = join(cwd, "state");
+  const store = new GatedUpdateStore(root);
+  let rpc: ControlledRpc | undefined;
+  const manager = await createManager(store, new OwnershipLockManager(root), {
+    rpcFactory: (options) => (rpc = new ControlledRpc(options)),
+    recordIdentityValidator: async () => true,
+  });
+  const spawned = await manager.spawn({ task: "work", cwd });
+  await waitTerminal(manager, spawned.task_id);
+  const releaseGate = new DeferredGate();
+  store.drainGate = releaseGate;
+  rpc!.owned = false;
+  rpc!.emit("exit", new Error("idle exit release race"));
+  await releaseGate.entered;
+  const closing = manager.close(spawned.session_id);
+  const contender = new OwnershipLockManager(root);
+  await assert.rejects(contender.acquire("logical", spawned.session_id), /session_in_use/);
+  releaseGate.release();
+  assert.equal((await closing).state, "closed");
+  assert.equal((await store.read(spawned.session_id)).state, "closed");
+  const acquired = await contender.acquire("logical", spawned.session_id);
+  await acquired.close();
+  await manager.shutdown();
+});
+
+test("same-manager close joins descriptor shutdown between native and logical release", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-manager-descriptor-close-"));
+  const root = join(cwd, "state");
+  const store = new SessionRecordStore(root);
+  const locks = new GatedSessionReleaseLockManager(root);
+  const releaseGate = new DeferredGate();
+  locks.releaseGate = releaseGate;
+  let rpc: ControlledRpc | undefined;
+  const manager = await createManager(store, locks, {
+    rpcFactory: (options) => (rpc = new ControlledRpc(options)),
+    recordIdentityValidator: async () => true,
+  });
+  const spawned = await manager.spawn({ task: "work", cwd });
+  await waitTerminal(manager, spawned.task_id);
+  rpc!.owned = false;
+  rpc!.emit("exit", new Error("descriptor release gate"));
+  await releaseGate.entered;
+  let closeSettled = false;
+  const closing = manager.close(spawned.session_id).then((status) => {
+    closeSettled = true;
+    return status;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(closeSettled, false);
+  const contender = new OwnershipLockManager(root);
+  await assert.rejects(contender.acquire("logical", spawned.session_id), /session_in_use/);
+  releaseGate.release();
+  const closed = await closing;
+  assert.equal(closed.state, "closed");
+  assert.equal((await store.read(spawned.session_id)).state, "closed");
+  const acquired = await contender.acquire("logical", spawned.session_id);
+  await acquired.close();
+});
+
+test("send during descriptor shutdown waits for release and never mutates without ownership", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-manager-descriptor-send-"));
+  const root = join(cwd, "state");
+  const store = new SessionRecordStore(root);
+  const locks = new GatedSessionReleaseLockManager(root);
+  const releaseGate = new DeferredGate();
+  locks.releaseGate = releaseGate;
+  const manager = await createManager(store, locks, {
+    rpcFactory: (options) => new ControlledRpc(options),
+  });
+  const spawned = await manager.spawn({ task: "work", cwd });
+  await waitTerminal(manager, spawned.task_id);
+  const release = manager.close(spawned.session_id);
+  await releaseGate.entered;
+  let sendSettled = false;
+  const sending = manager.send(spawned.session_id, "must not run").then(
+    () => ({ error: undefined }),
+    (error: unknown) => ({ error }),
+  ).then((outcome) => {
+    sendSettled = true;
+    return outcome;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(sendSettled, false);
+  releaseGate.release();
+  assert.equal((await release).state, "closed");
+  const outcome = await sending;
+  assert.match(String(outcome.error), /session_closed/);
+  const stored = await store.read(spawned.session_id);
+  assert.equal(stored.state, "closed");
+  assert.equal(stored.lastTask?.taskId, spawned.task_id);
+});
+
+test("send joins pre-descriptor drain release before restoring with new ownership", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-manager-drain-send-"));
+  const root = join(cwd, "state");
+  const store = new GatedUpdateStore(root);
+  let firstRpc: ControlledRpc | undefined;
+  let rpcCount = 0;
+  const manager = await createManager(store, new OwnershipLockManager(root), {
+    rpcFactory: (options) => {
+      const rpc = new ControlledRpc(options);
+      rpcCount += 1;
+      if (rpcCount === 1) firstRpc = rpc;
+      return rpc;
+    },
+    recordIdentityValidator: async () => true,
+  });
+  const spawned = await manager.spawn({ task: "first", cwd });
+  await waitTerminal(manager, spawned.task_id);
+  const drainGate = new DeferredGate();
+  store.drainGate = drainGate;
+  firstRpc!.owned = false;
+  firstRpc!.emit("exit", new Error("pre-descriptor drain gate"));
+  await drainGate.entered;
+
+  let sendSettled = false;
+  const sending = manager.send(spawned.session_id, "second").then((result) => {
+    sendSettled = true;
+    return result;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(sendSettled, false);
+  const contender = new OwnershipLockManager(root);
+  await assert.rejects(contender.acquire("logical", spawned.session_id), /session_in_use/);
+
+  drainGate.release();
+  const sent = await sending;
+  assert.equal(sent.session_id, spawned.session_id);
+  assert.equal(rpcCount, 2);
+  await waitTerminal(manager, sent.task_id);
+  const status = await manager.status(spawned.session_id);
+  assert.equal(status.last_task?.task_id, sent.task_id);
+  assert.equal(status.last_task?.status, "completed");
+  assert.equal((await manager.close(spawned.session_id)).state, "closed");
+  assert.equal((await store.read(spawned.session_id)).state, "closed");
 });

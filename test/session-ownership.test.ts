@@ -180,3 +180,18 @@ test("migration coordinator orders, deduplicates and contends through kernel loc
   await first;
   await coordinator.withCandidateLocks([{ kind: "migration", key: "v1" }], async () => undefined);
 });
+
+test("ownership initialize and acquire normalize secure path failures without paths", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-ownership-path-normalize-"));
+  const external = await mkdtemp(join(tmpdir(), "pi-ownership-path-external-"));
+  const linkedRoot = join(parent, "linked-root");
+  await symlink(external, linkedRoot);
+  const manager = new OwnershipLockManager(linkedRoot);
+  for (const operation of [() => manager.initialize(), () => manager.acquire("logical", "safe-key")]) {
+    await assert.rejects(operation, (error: unknown) => {
+      assert.equal((error as Error).message, "ownership_unavailable: secure ownership path validation failed");
+      assert.doesNotMatch((error as Error).message, new RegExp(parent.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+      return true;
+    });
+  }
+});

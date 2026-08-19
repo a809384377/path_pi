@@ -80,7 +80,32 @@ export async function assertPrivateDirectory(path: string): Promise<void> {
   }
 }
 
-export async function readSecureFile(path: string): Promise<Buffer> {
+export interface SecureReadOptions {
+  requireMode?: number;
+  requireCurrentUid?: boolean;
+}
+
+export interface AtomicWriteHooks {
+  afterPublish?: () => Promise<void> | void;
+}
+
+export class AtomicWriteError extends Error {
+  readonly published: boolean;
+
+  constructor(error: unknown, published: boolean) {
+    super(errorMessage(error), { cause: error });
+    this.name = "AtomicWriteError";
+    this.published = published;
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code) (this as NodeJS.ErrnoException).code = code;
+  }
+}
+
+export function atomicWriteWasPublished(error: unknown): boolean {
+  return error instanceof AtomicWriteError && error.published;
+}
+
+export async function readSecureFile(path: string, options: SecureReadOptions = {}): Promise<Buffer> {
   const absolute = absolutePath(path);
   await assertNoSymlinkComponents(absolute);
   const noFollow = constants.O_NOFOLLOW ?? 0;
@@ -93,6 +118,12 @@ export async function readSecureFile(path: string): Promise<Buffer> {
   try {
     const opened = await handle.stat({ bigint: true });
     if (!opened.isFile()) throw new Error(`unsafe_file_type: ${absolute}`);
+    if (options.requireMode !== undefined && (Number(opened.mode) & 0o777) !== options.requireMode) {
+      throw new Error(`unsafe_file_mode: ${absolute} must be ${options.requireMode.toString(8).padStart(4, "0")}`);
+    }
+    if (options.requireCurrentUid && typeof process.geteuid === "function" && Number(opened.uid) !== process.geteuid()) {
+      throw new Error(`unsafe_file_owner: ${absolute}`);
+    }
     const before = await lstat(absolute, { bigint: true });
     if (before.isSymbolicLink() || !before.isFile() || before.dev !== opened.dev || before.ino !== opened.ino) {
       throw new Error(`unsafe_file_identity: ${absolute}`);
@@ -109,7 +140,11 @@ export async function readSecureFile(path: string): Promise<Buffer> {
   }
 }
 
-export async function publishNoReplace(path: string, bytes: Uint8Array): Promise<void> {
+export async function publishNoReplace(
+  path: string,
+  bytes: Uint8Array,
+  hooks: AtomicWriteHooks = {},
+): Promise<void> {
   const absolute = absolutePath(path);
   const directory = dirname(absolute);
   await assertPrivateDirectory(directory);
@@ -121,17 +156,24 @@ export async function publishNoReplace(path: string, bytes: Uint8Array): Promise
   } finally {
     await handle.close();
   }
+  let published = false;
   try {
     await link(temporary, absolute);
+    published = true;
+    await hooks.afterPublish?.();
     await unlink(temporary);
     await syncDirectory(directory);
   } catch (error) {
     await rm(temporary, { force: true });
-    throw error;
+    throw new AtomicWriteError(error, published);
   }
 }
 
-export async function replaceAtomic(path: string, bytes: Uint8Array): Promise<void> {
+export async function replaceAtomic(
+  path: string,
+  bytes: Uint8Array,
+  hooks: AtomicWriteHooks = {},
+): Promise<void> {
   const absolute = absolutePath(path);
   const directory = dirname(absolute);
   await assertPrivateDirectory(directory);
@@ -143,12 +185,15 @@ export async function replaceAtomic(path: string, bytes: Uint8Array): Promise<vo
   } finally {
     await handle.close();
   }
+  let published = false;
   try {
     await rename(temporary, absolute);
+    published = true;
+    await hooks.afterPublish?.();
     await syncDirectory(directory);
   } catch (error) {
     await rm(temporary, { force: true });
-    throw error;
+    throw new AtomicWriteError(error, published);
   }
 }
 

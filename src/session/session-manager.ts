@@ -10,6 +10,7 @@ import { readPiSessionIdentity, type PiSessionIdentity } from "../store/pi-sessi
 import { assertNoSymlinkComponents, assertPrivateDirectory, ensurePrivateDirectory } from "../store/secure-fs.js";
 import {
   SessionRecordStore,
+  isRecordDurabilityUncertain,
   sessionRecordHash,
   type SessionRecordV2,
 } from "../store/session-store.js";
@@ -53,6 +54,8 @@ interface ResidentSession {
   cleanupPromise: Promise<void> | undefined;
   cleanupStopFailed: boolean;
   cleanupIntent: "close" | "shutdown" | undefined;
+  lifecycleTail: Promise<void>;
+  releasePromise: Promise<boolean> | undefined;
   verifiedIdentity: PiSessionIdentity | undefined;
 }
 
@@ -68,6 +71,7 @@ export interface SessionManagerOptions {
   nativeIdFactory?: () => string;
   logger?: (message: string) => void;
   cwdValidator?: (cwd: string) => Promise<string>;
+  recordIdentityValidator?: (record: SessionRecordV2) => Promise<boolean>;
 }
 
 export interface SpawnInput { task: string; cwd: string; name?: string; model?: string }
@@ -86,7 +90,8 @@ export interface SessionStatus {
   cwd: string;
   model?: string;
   state: SessionState;
-  resident: boolean;
+  resident: boolean | "unknown";
+  ownership: "local" | "other" | "free_or_unknown";
   recoverable: boolean;
   current_task_id: string | null;
   last_task?: TaskResult;
@@ -133,7 +138,6 @@ export class SessionManager extends EventEmitter {
   async initialize(): Promise<void> {
     await this.#locks.initialize();
     await ensurePrivateDirectory(join(this.#store.root, "pi-sessions"));
-    for (const record of await this.#store.list()) this.#cacheDiskRecord(record);
   }
 
   async spawn(input: SpawnInput): Promise<DispatchResult> {
@@ -176,7 +180,28 @@ export class SessionManager extends EventEmitter {
         activeTaskId: taskId,
         updatedAt: now,
       };
-      await this.#store.create(record);
+      try {
+        await this.#store.create(record);
+      } catch (error) {
+        if (!isRecordDurabilityUncertain(error)) throw error;
+        session = {
+          record: error.record,
+          state: "dispatching",
+          process: undefined,
+          ownership,
+          activeTask: task,
+          closeRequested: false,
+          cleanupPromise: undefined,
+          cleanupStopFailed: false,
+          cleanupIntent: undefined,
+          lifecycleTail: Promise.resolve(),
+          releasePromise: undefined,
+          verifiedIdentity: undefined,
+        };
+        this.#sessions.set(sessionId, session);
+        this.#tasks.set(taskId, task);
+        throw error;
+      }
       session = {
         record,
         state: "dispatching",
@@ -187,6 +212,8 @@ export class SessionManager extends EventEmitter {
         cleanupPromise: undefined,
         cleanupStopFailed: false,
         cleanupIntent: undefined,
+        lifecycleTail: Promise.resolve(),
+        releasePromise: undefined,
         verifiedIdentity: undefined,
       };
       this.#sessions.set(sessionId, session);
@@ -295,48 +322,33 @@ export class SessionManager extends EventEmitter {
     const ids = [...new Set(taskIds)];
     if (ids.length === 0) throw new Error("task_ids must not be empty");
     if (!Number.isFinite(timeoutMs) || timeoutMs < 0) throw new Error("timeout must be a non-negative finite number");
-    for (const id of ids) if (!this.#tasks.has(id)) throw new Error(`unknown_task: ${id}`);
-    const evaluate = (): WaitResult | undefined => {
-      const completed = ids.map((id) => this.#tasks.get(id)!).filter(isPublishedTerminal);
-      const ready = mode === "all" ? completed.length === ids.length : completed.length > 0;
-      if (!ready) return undefined;
-      const done = new Set(completed.map((task) => task.taskId));
-      return { completed: completed.map(toTaskResult), pending: ids.filter((id) => !done.has(id)), timed_out: false };
-    };
-    const immediate = evaluate();
-    if (immediate) return immediate;
-    if (timeoutMs === 0) return this.#timeoutResult(ids);
-    return new Promise<WaitResult>((resolveWait, rejectWait) => {
-      let settled = false;
-      const cleanup = (): void => {
-        clearTimeout(timer);
-        this.off("taskTerminal", onTerminal);
-        this.off("taskPersistenceError", onPersistence);
-      };
-      const finish = (value: WaitResult): void => { if (!settled) { settled = true; cleanup(); resolveWait(value); } };
-      const fail = (error: Error): void => { if (!settled) { settled = true; cleanup(); rejectWait(error); } };
-      const onPersistence = (taskId: string): void => {
-        if (!ids.includes(taskId)) return;
-        const task = this.#tasks.get(taskId);
-        if (task?.persistenceError) fail(new Error(`persistence_error: task ${taskId}: ${task.persistenceError}`));
-      };
-      const onTerminal = (): void => { const value = evaluate(); if (value) finish(value); };
-      this.on("taskTerminal", onTerminal);
-      this.on("taskPersistenceError", onPersistence);
-      const timer = setTimeout(() => finish(this.#timeoutResult(ids)), timeoutMs);
-      onTerminal();
-    });
+    if (ids.every((id) => {
+      const task = this.#tasks.get(id);
+      return task !== undefined && this.#sessions.get(task.sessionId)?.ownership?.held === true;
+    })) {
+      return this.#waitLocal(ids, mode, timeoutMs);
+    }
+    const targets = await this.#resolveWaitTargets(ids);
+    const deadline = Date.now() + timeoutMs;
+    let observed = await this.#evaluateWait(ids, targets);
+    if (waitReady(observed, ids.length, mode)) return waitResult(observed, ids, false);
+    if (timeoutMs === 0) return waitResult(observed, ids, true);
+
+    while (Date.now() < deadline) {
+      await this.#waitForLocalEvent(Math.min(25, Math.max(1, deadline - Date.now())));
+      observed = await this.#evaluateWait(ids, targets);
+      if (waitReady(observed, ids.length, mode)) return waitResult(observed, ids, false);
+    }
+    observed = await this.#evaluateWait(ids, targets);
+    return waitResult(observed, ids, true);
   }
 
-  status(sessionId: string): SessionStatus;
-  status(): SessionStatus[];
-  status(sessionId?: string): SessionStatus | SessionStatus[] {
-    if (sessionId) {
-      const session = this.#sessions.get(sessionId);
-      if (!session) throw new Error(`unknown_session: ${sessionId}`);
-      return toSessionStatus(session);
-    }
-    return [...this.#sessions.values()].filter((session) => session.record.state !== "closed").map(toSessionStatus);
+  async status(sessionId: string): Promise<SessionStatus>;
+  async status(): Promise<SessionStatus[]>;
+  async status(sessionId?: string): Promise<SessionStatus | SessionStatus[]> {
+    if (sessionId) return this.#statusFromDisk(await this.#store.read(sessionId));
+    const records = await this.#store.list();
+    return Promise.all(records.filter((record) => record.state !== "closed").map((record) => this.#statusFromDisk(record)));
   }
 
   async close(sessionId: string): Promise<SessionStatus> {
@@ -349,12 +361,14 @@ export class SessionManager extends EventEmitter {
   }
 
   async #closeAdmitted(sessionId: string): Promise<SessionStatus> {
+    const releasing = this.#sessions.get(sessionId);
+    if (releasing?.releasePromise) releasing.closeRequested = true;
     let session = await this.#loadSession(sessionId);
-    if (session.record.state === "closed") return toSessionStatus(session);
+    if (session.record.state === "closed") return this.#statusFromDisk(session.record);
     if (session.process || session.ownership?.held) {
       session.closeRequested = true;
       await this.#cleanupSession(session, "close");
-      return toSessionStatus(session);
+      return this.#statusFromDisk(session.record);
     }
     session = await this.#acquireForRemoteClose(session.record);
     session.closeRequested = true;
@@ -372,7 +386,7 @@ export class SessionManager extends EventEmitter {
     });
     session.state = "closed";
     await this.#releaseOwnership(session);
-    return toSessionStatus(session);
+    return this.#statusFromDisk(session.record);
   }
 
   shutdown(): Promise<void> {
@@ -426,50 +440,58 @@ export class SessionManager extends EventEmitter {
     }
   }
 
-  async #reconcile(initial: SessionRecordV2): Promise<ResidentSession> {
+  async #reconcile(initial: SessionRecordV2, expectedTaskId?: string): Promise<ResidentSession> {
     if (!initial.piSessionId) throw new Error(`session_not_recoverable: ${initial.sessionId} has no native identity`);
     const ownership = await this.#locks.acquireSession(initial.sessionId, initial.piSessionId, { purpose: "crash-reconciliation" });
     const session = this.#residentFromRecord(initial);
     session.ownership = ownership;
     this.#sessions.set(initial.sessionId, session);
     try {
-      const fresh = await this.#store.read(initial.sessionId);
-      if (fresh.revision !== initial.revision || fresh.piSessionId !== initial.piSessionId) throw new Error(`revision_conflict: ${initial.sessionId}`);
-      let valid = false;
-      let verifiedIdentity: PiSessionIdentity | undefined;
-      if (fresh.sessionFile && isExclusiveSessionPath(this.#store.root, fresh.sessionId, fresh.sessionFile)) {
-        try {
-          await assertPrivateDirectory(join(this.#store.root, "pi-sessions", sessionRecordHash(fresh.sessionId)));
-          const identity = await readPiSessionIdentity(fresh.sessionFile);
-          valid = identity.sessionId === fresh.piSessionId;
-          if (valid) verifiedIdentity = identity;
-        } catch {}
-      }
-      const lastTask = fresh.activeTaskId
-        ? interruptedTask(fresh.activeTaskId, fresh.sessionId, "Previous MCP host stopped before the task completed")
-        : fresh.lastTask;
-      await this.#mutate(session, {
-        ...fresh,
-        revision: fresh.revision + 1,
-        state: valid ? "dormant" : "error",
-        recoverable: valid,
-        activeTaskId: null,
-        ...(lastTask ? { lastTask } : {}),
-        updatedAt: new Date().toISOString(),
+      return await this.#withLifecycle(session, async () => {
+        const fresh = await this.#store.read(initial.sessionId);
+        if (fresh.revision !== initial.revision || fresh.piSessionId !== initial.piSessionId) throw new Error(`revision_conflict: ${initial.sessionId}`);
+        if (expectedTaskId !== undefined && fresh.activeTaskId !== expectedTaskId) {
+          throw new Error(`unknown_task: ${expectedTaskId}`);
+        }
+        let valid = false;
+        let verifiedIdentity: PiSessionIdentity | undefined;
+        if (fresh.sessionFile && isExclusiveSessionPath(this.#store.root, fresh.sessionId, fresh.sessionFile)) {
+          try {
+            await assertPrivateDirectory(join(this.#store.root, "pi-sessions", sessionRecordHash(fresh.sessionId)));
+            const identity = await readPiSessionIdentity(fresh.sessionFile);
+            valid = identity.sessionId === fresh.piSessionId;
+            if (valid) verifiedIdentity = identity;
+          } catch {}
+        }
+        const lastTask = fresh.activeTaskId
+          ? interruptedTask(fresh.activeTaskId, fresh.sessionId, "Previous MCP host stopped before the task completed")
+          : fresh.lastTask;
+        await this.#mutate(session, {
+          ...fresh,
+          revision: fresh.revision + 1,
+          state: valid ? "dormant" : "error",
+          recoverable: valid,
+          activeTaskId: null,
+          ...(lastTask ? { lastTask } : {}),
+          updatedAt: new Date().toISOString(),
+        });
+        session.state = valid ? "dormant" : "error";
+        session.verifiedIdentity = verifiedIdentity;
+        if (lastTask) this.#tasks.set(lastTask.taskId, fromStoredTask(lastTask, fresh.generation));
+        return session;
       });
-      session.state = valid ? "dormant" : "error";
-      session.verifiedIdentity = verifiedIdentity;
-      if (lastTask) this.#tasks.set(lastTask.taskId, fromStoredTask(lastTask, fresh.generation));
-      return session;
     } catch (error) {
-      await this.#releaseOwnership(session).catch(() => undefined);
+      await this.#withLifecycle(session, () => this.#releaseOwnership(session, true)).catch(() => undefined);
       throw error;
     }
   }
 
   async #acquireForRemoteClose(initial: SessionRecordV2): Promise<ResidentSession> {
     let ownership: SessionOwnership;
-    if (initial.recoverable && initial.sessionFile && initial.piSessionId) {
+    if (initial.sessionFile || initial.piSessionId) {
+      if (!initial.sessionFile || !initial.piSessionId) {
+        throw new Error(`session_identity_incomplete: ${initial.sessionId}`);
+      }
       const logical = await this.#locks.acquire("logical", initial.sessionId, { purpose: "remote-close" });
       try {
         const identity = await readPiSessionIdentity(initial.sessionFile);
@@ -481,8 +503,8 @@ export class SessionManager extends EventEmitter {
         throw error;
       }
     } else {
-      if (!initial.piSessionId) throw new Error(`session_not_recoverable: ${initial.sessionId} has no native identity`);
-      ownership = await this.#locks.acquireSession(initial.sessionId, initial.piSessionId, { purpose: "remote-close" });
+      const logical = await this.#locks.acquire("logical", initial.sessionId, { purpose: "remote-close" });
+      ownership = new SessionOwnership(logical);
     }
     try {
       const fresh = await this.#store.read(initial.sessionId);
@@ -689,6 +711,10 @@ export class SessionManager extends EventEmitter {
   }
 
   async #handleExit(session: ResidentSession, rpc: PiRpcProcess, error: Error): Promise<void> {
+    return this.#withLifecycle(session, () => this.#runHandleExit(session, rpc, error));
+  }
+
+  async #runHandleExit(session: ResidentSession, rpc: PiRpcProcess, error: Error): Promise<void> {
     if (session.process !== rpc) return;
     session.process = undefined;
     if (session.state === "closed") return;
@@ -696,17 +722,19 @@ export class SessionManager extends EventEmitter {
       if (session.cleanupStopFailed) {
         session.cleanupStopFailed = false;
         session.cleanupPromise = undefined;
-        await this.#cleanupSession(session, session.cleanupIntent ?? (session.closeRequested ? "close" : "shutdown"));
+        await this.#runCleanup(session);
       }
       return;
     }
     const task = session.activeTask;
     if (task?.finalizationPromise) await task.finalizationPromise;
+    if (session.closeRequested || session.cleanupIntent || session.record.state === "closed") return;
     let durable = true;
     if (task && !task.published) {
       durable = await this.#finalizeTask(session, task, "failed", { error: error.message });
-    } else if (session.record.state !== "closed") {
+    } else {
       const recoverable = await this.#recordIdentityValid(session.record);
+      if (session.closeRequested || session.cleanupIntent) return;
       try {
         await this.#mutate(session, {
           ...session.record,
@@ -719,10 +747,16 @@ export class SessionManager extends EventEmitter {
         durable = false;
       }
     }
-    if (durable && !rpc.processOwned) await this.#releaseOwnership(session).catch(() => undefined);
+    if (durable && !rpc.processOwned) {
+      await this.#releaseOwnership(session, true).catch(() => undefined);
+    }
   }
 
   async #failDispatch(session: ResidentSession, task: TaskRecord, error: unknown): Promise<void> {
+    return this.#withLifecycle(session, () => this.#runFailDispatch(session, task, error));
+  }
+
+  async #runFailDispatch(session: ResidentSession, task: TaskRecord, error: unknown): Promise<void> {
     const rpc = session.process;
     if (rpc) {
       session.state = "closing";
@@ -735,11 +769,12 @@ export class SessionManager extends EventEmitter {
         throw stopError;
       }
     }
-    if (!task.published && !session.closeRequested && session.record.state !== "closed") {
+    if (session.closeRequested || session.cleanupIntent) return;
+    if (!task.published && session.record.state !== "closed") {
       const durable = await this.#finalizeTask(session, task, "failed", { error: errorMessage(error) });
       if (!durable) throw new Error(`persistence_error: task ${task.taskId}: ${task.persistenceError ?? "unknown"}`);
     }
-    if (session.ownership?.held) await this.#releaseOwnership(session);
+    if (session.ownership?.held) await this.#releaseOwnership(session, true);
   }
 
   async #cleanupSession(session: ResidentSession, intent: "close" | "shutdown"): Promise<void> {
@@ -747,7 +782,7 @@ export class SessionManager extends EventEmitter {
     if (session.record.state === "closed" && !session.ownership?.held) return;
     if (session.cleanupPromise) return session.cleanupPromise;
     session.cleanupIntent = session.closeRequested ? "close" : intent;
-    const attempt = this.#runCleanup(session);
+    const attempt = this.#withLifecycle(session, () => this.#runCleanup(session));
     session.cleanupPromise = attempt;
     let succeeded = false;
     try {
@@ -811,38 +846,60 @@ export class SessionManager extends EventEmitter {
   }
 
   async #recordIdentityValid(record: SessionRecordV2): Promise<boolean> {
+    if (this.#options.recordIdentityValidator) return this.#options.recordIdentityValidator(record);
     if (!record.sessionFile || !record.piSessionId) return false;
     try { return (await readPiSessionIdentity(record.sessionFile)).sessionId === record.piSessionId; }
     catch { return false; }
   }
 
-  async #releaseOwnership(session: ResidentSession): Promise<void> {
+  async #releaseOwnership(session: ResidentSession, preserveForCleanup = false): Promise<boolean> {
+    if (session.releasePromise) return session.releasePromise;
+    const release = this.#runReleaseOwnership(session, preserveForCleanup);
+    session.releasePromise = release;
+    try {
+      return await release;
+    } finally {
+      if (session.releasePromise === release) session.releasePromise = undefined;
+    }
+  }
+
+  async #runReleaseOwnership(session: ResidentSession, preserveForCleanup: boolean): Promise<boolean> {
     if (session.process?.processOwned) throw new Error(`ownership_release_blocked: Pi process group ${session.process.pid ?? "unknown"} remains alive`);
     await this.#store.drain(session.record.sessionId);
+    if (preserveForCleanup && (session.closeRequested || session.cleanupIntent)) return false;
     const ownership = session.ownership;
-    if (!ownership) return;
+    if (!ownership) return true;
     await ownership.close();
     session.ownership = undefined;
+    return true;
   }
 
   async #mutate(session: ResidentSession, next: SessionRecordV2): Promise<void> {
-    await this.#store.updateOwned(session.record.sessionId, session.record.revision, next);
+    if (!session.ownership?.held) throw new Error(`ownership_required: ${session.record.sessionId}`);
+    if (session.record.state === "closed" && next.state !== "closed") {
+      throw new Error(`session_closed: ${session.record.sessionId}`);
+    }
+    try {
+      await this.#store.updateOwned(session.record.sessionId, session.record.revision, next);
+    } catch (error) {
+      if (isRecordDurabilityUncertain(error)) session.record = error.record;
+      throw error;
+    }
+    if (!session.ownership.held) throw new Error(`ownership_lost: ${session.record.sessionId}`);
     session.record = next;
   }
 
   async #loadSession(sessionId: string): Promise<ResidentSession> {
     const local = this.#sessions.get(sessionId);
+    if (local?.releasePromise) {
+      await local.releasePromise;
+      return this.#loadSession(sessionId);
+    }
     if (local?.ownership?.held || local?.process) return local;
     const record = await this.#store.read(sessionId);
     const session = this.#residentFromRecord(record);
     this.#sessions.set(sessionId, session);
     return session;
-  }
-
-  #cacheDiskRecord(record: SessionRecordV2): void {
-    const session = this.#residentFromRecord(record);
-    this.#sessions.set(record.sessionId, session);
-    if (record.lastTask) this.#tasks.set(record.lastTask.taskId, fromStoredTask(record.lastTask, record.generation));
   }
 
   #residentFromRecord(record: SessionRecordV2): ResidentSession {
@@ -856,6 +913,8 @@ export class SessionManager extends EventEmitter {
       cleanupPromise: undefined,
       cleanupStopFailed: false,
       cleanupIntent: undefined,
+      lifecycleTail: Promise.resolve(),
+      releasePromise: undefined,
       verifiedIdentity: undefined,
     };
   }
@@ -866,10 +925,168 @@ export class SessionManager extends EventEmitter {
     }
   }
 
-  #timeoutResult(ids: readonly string[]): WaitResult {
-    const completed = ids.map((id) => this.#tasks.get(id)!).filter(isPublishedTerminal);
-    const terminal = new Set(completed.map((task) => task.taskId));
-    return { completed: completed.map(toTaskResult), pending: ids.filter((id) => !terminal.has(id)), timed_out: true };
+  async #waitLocal(ids: readonly string[], mode: "any" | "all", timeoutMs: number): Promise<WaitResult> {
+    const evaluate = (): WaitResult | undefined => {
+      const tasks = ids.map((id) => this.#tasks.get(id)!);
+      for (const task of tasks) {
+        if (task.persistenceError) throw new Error(`persistence_error: task ${task.taskId}: ${task.persistenceError}`);
+      }
+      const completed = tasks.filter(isPublishedTerminal).map(toTaskResult);
+      const ready = mode === "all" ? completed.length === ids.length : completed.length > 0;
+      if (!ready) return undefined;
+      const done = new Set(completed.map((task) => task.task_id));
+      return { completed, pending: ids.filter((id) => !done.has(id)), timed_out: false };
+    };
+    const immediate = evaluate();
+    if (immediate) return immediate;
+    if (timeoutMs === 0) return { completed: [], pending: [...ids], timed_out: true };
+    return new Promise<WaitResult>((resolveWait, rejectWait) => {
+      const cleanup = (): void => {
+        clearTimeout(timer);
+        this.off("taskTerminal", onChange);
+        this.off("taskPersistenceError", onChange);
+      };
+      const onChange = (): void => {
+        try {
+          const result = evaluate();
+          if (!result) return;
+          cleanup();
+          resolveWait(result);
+        } catch (error) {
+          cleanup();
+          rejectWait(error);
+        }
+      };
+      const timer = setTimeout(() => {
+        cleanup();
+        const completed = ids.map((id) => this.#tasks.get(id)!).filter(isPublishedTerminal).map(toTaskResult);
+        const done = new Set(completed.map((task) => task.task_id));
+        resolveWait({ completed, pending: ids.filter((id) => !done.has(id)), timed_out: true });
+      }, timeoutMs);
+      this.on("taskTerminal", onChange);
+      this.on("taskPersistenceError", onChange);
+      onChange();
+    });
+  }
+
+  async #resolveWaitTargets(ids: readonly string[]): Promise<Map<string, string>> {
+    const targets = new Map<string, string>();
+    const unresolved: string[] = [];
+    for (const id of ids) {
+      const local = this.#tasks.get(id);
+      const resident = local ? this.#sessions.get(local.sessionId) : undefined;
+      if (local && resident?.ownership?.held) targets.set(id, local.sessionId);
+      else unresolved.push(id);
+    }
+    if (unresolved.length > 0) {
+      const found = await this.#store.findTaskRecords(unresolved);
+      for (const id of unresolved) {
+        const record = found.get(id);
+        if (!record) throw new Error(`unknown_task: ${id}`);
+        targets.set(id, record.sessionId);
+      }
+    }
+    return targets;
+  }
+
+  async #evaluateWait(
+    ids: readonly string[],
+    targets: ReadonlyMap<string, string>,
+  ): Promise<Map<string, TaskResult | undefined>> {
+    const observed = new Map<string, TaskResult | undefined>();
+    for (const id of ids) {
+      const local = this.#tasks.get(id);
+      const localSession = local ? this.#sessions.get(local.sessionId) : undefined;
+      if (local && localSession?.ownership?.held) {
+        if (local.persistenceError) throw new Error(`persistence_error: task ${id}: ${local.persistenceError}`);
+        observed.set(id, isPublishedTerminal(local) ? toTaskResult(local) : undefined);
+        continue;
+      }
+      const sessionId = targets.get(id);
+      if (!sessionId) throw new Error(`unknown_task: ${id}`);
+      const record = await this.#store.read(sessionId);
+      if (record.lastTask?.taskId === id) {
+        observed.set(id, storedTaskResult(record.lastTask));
+        continue;
+      }
+      if (record.activeTaskId !== id) throw new Error(`unknown_task: ${id}`);
+      await this.#reconcileRemoteWait(record, id);
+      const fresh = await this.#store.read(record.sessionId);
+      if (fresh.lastTask?.taskId === id) observed.set(id, storedTaskResult(fresh.lastTask));
+      else if (fresh.activeTaskId === id) observed.set(id, undefined);
+      else throw new Error(`unknown_task: ${id}`);
+    }
+    return observed;
+  }
+
+  async #reconcileRemoteWait(record: SessionRecordV2, expectedTaskId: string): Promise<void> {
+    if (record.activeTaskId !== expectedTaskId || !["creating", "running"].includes(record.state)) return;
+    let session: ResidentSession | undefined;
+    try {
+      if (record.state === "creating" || !record.recoverable) {
+        session = await this.#reconcile(record, expectedTaskId);
+      } else {
+        session = await this.#acquireForRemoteClose(record);
+        await this.#withLifecycle(session, async () => {
+          const fresh = await this.#store.read(record.sessionId);
+          if (fresh.activeTaskId !== expectedTaskId || !["creating", "running"].includes(fresh.state)) {
+            throw new Error(`unknown_task: ${expectedTaskId}`);
+          }
+          const lastTask = interruptedTask(
+            expectedTaskId,
+            record.sessionId,
+            "Previous MCP host stopped before the task completed",
+          );
+          await this.#mutate(session!, {
+            ...fresh,
+            revision: fresh.revision + 1,
+            state: "dormant",
+            activeTaskId: null,
+            lastTask,
+            updatedAt: new Date().toISOString(),
+          });
+          session!.state = "dormant";
+        });
+      }
+    } catch (error) {
+      if (/^(session_in_use|native_session_in_use):/.test(errorMessage(error))) return;
+      if (/^(revision_conflict|unknown_session):/.test(errorMessage(error))) return;
+      throw error;
+    } finally {
+      if (session?.ownership?.held) {
+        await this.#withLifecycle(session, () => this.#releaseOwnership(session!, true));
+      }
+    }
+  }
+
+  #withLifecycle<T>(session: ResidentSession, operation: () => Promise<T>): Promise<T> {
+    const run = session.lifecycleTail.then(operation);
+    session.lifecycleTail = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  #waitForLocalEvent(timeoutMs: number): Promise<void> {
+    return new Promise((resolveWait) => {
+      let settled = false;
+      const finish = (): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.off("taskTerminal", finish);
+        this.off("taskPersistenceError", finish);
+        resolveWait();
+      };
+      const timer = setTimeout(finish, timeoutMs);
+      this.on("taskTerminal", finish);
+      this.on("taskPersistenceError", finish);
+    });
+  }
+
+  async #statusFromDisk(record: SessionRecordV2): Promise<SessionStatus> {
+    const local = this.#sessions.get(record.sessionId);
+    if (local?.ownership?.held && local.record.revision === record.revision) return toSessionStatus(local, "local");
+    const ownership = await this.#locks.observe("logical", record.sessionId);
+    return recordSessionStatus(record, ownership);
   }
 
   #background(session: ResidentSession, operation: Promise<void>): void {
@@ -956,7 +1173,7 @@ function toTaskResult(task: TaskRecord & { status: StoredTaskStatus }): TaskResu
   };
 }
 
-function toSessionStatus(session: ResidentSession): SessionStatus {
+function toSessionStatus(session: ResidentSession, ownership: "local" = "local"): SessionStatus {
   const record = session.record;
   return {
     session_id: record.sessionId,
@@ -965,6 +1182,7 @@ function toSessionStatus(session: ResidentSession): SessionStatus {
     ...(record.model ? { model: record.model } : {}),
     state: session.state,
     resident: session.process?.processOwned ?? false,
+    ownership,
     recoverable: record.recoverable,
     current_task_id: record.activeTaskId,
     ...(record.lastTask ? { last_task: storedTaskResult(record.lastTask) } : {}),
@@ -972,6 +1190,44 @@ function toSessionStatus(session: ResidentSession): SessionStatus {
     ...(record.sessionFile ? { session_file: record.sessionFile } : {}),
     ...(session.activeTask?.persistenceError ? { persistence_error: session.activeTask.persistenceError } : {}),
   };
+}
+
+function recordSessionStatus(
+  record: SessionRecordV2,
+  ownership: "other" | "free_or_unknown",
+): SessionStatus {
+  return {
+    session_id: record.sessionId,
+    ...(record.name ? { name: record.name } : {}),
+    cwd: record.cwd,
+    ...(record.model ? { model: record.model } : {}),
+    state: toRuntimeState(record.state),
+    resident: "unknown",
+    ownership,
+    recoverable: record.recoverable,
+    current_task_id: record.activeTaskId,
+    ...(record.lastTask ? { last_task: storedTaskResult(record.lastTask) } : {}),
+    ...(record.piSessionId ? { pi_session_id: record.piSessionId } : {}),
+    ...(record.sessionFile ? { session_file: record.sessionFile } : {}),
+  };
+}
+
+function waitReady(observed: ReadonlyMap<string, TaskResult | undefined>, total: number, mode: "any" | "all"): boolean {
+  const completed = [...observed.values()].filter((value): value is TaskResult => value !== undefined).length;
+  return mode === "all" ? completed === total : completed > 0;
+}
+
+function waitResult(
+  observed: ReadonlyMap<string, TaskResult | undefined>,
+  ids: readonly string[],
+  timedOut: boolean,
+): WaitResult {
+  const completed = ids.flatMap((id) => {
+    const task = observed.get(id);
+    return task ? [task] : [];
+  });
+  const done = new Set(completed.map((task) => task.task_id));
+  return { completed, pending: ids.filter((id) => !done.has(id)), timed_out: timedOut };
 }
 
 function storedTaskResult(task: StoredTask): TaskResult {

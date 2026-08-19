@@ -3,7 +3,7 @@ import { constants } from "node:fs";
 import { lstat, open, type FileHandle } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import type { MigrationCandidate, MigrationCandidateLockCoordinator } from "../store/v1-migration.js";
-import { assertNoSymlinkComponents, assertPrivateDirectory, ensurePrivateDirectory, syncDirectory } from "../store/secure-fs.js";
+import { assertNoSymlinkComponents, assertPrivateDirectory, ensurePrivateDirectory, readSecureFile, syncDirectory } from "../store/secure-fs.js";
 import { flockExclusiveNonblocking } from "./flock.js";
 
 export type OwnershipDomain = "migration" | "source" | "logical" | "native";
@@ -49,27 +49,34 @@ export class OwnershipLockHandle {
     const file = this.#file;
     if (!file) return;
     this.#file = undefined;
+    await writeReleasedDiagnostic(file, this.domain, this.key).catch(() => undefined);
     // Never call LOCK_UN: descendants may share this open-file description.
     await file.close();
   }
 }
 
+export interface SessionOwnershipCloseHooks {
+  afterNativeClose?: () => Promise<void> | void;
+}
+
 export class SessionOwnership {
   readonly logical: OwnershipLockHandle;
-  readonly native: OwnershipLockHandle;
+  readonly native: OwnershipLockHandle | undefined;
+  readonly #closeHooks: SessionOwnershipCloseHooks;
   #closed = false;
 
-  constructor(logical: OwnershipLockHandle, native: OwnershipLockHandle) {
+  constructor(logical: OwnershipLockHandle, native?: OwnershipLockHandle, closeHooks: SessionOwnershipCloseHooks = {}) {
     this.logical = logical;
     this.native = native;
+    this.#closeHooks = closeHooks;
   }
 
-  get inheritedFds(): readonly [number, number] {
-    return [this.logical.inheritedFd, this.native.inheritedFd];
+  get inheritedFds(): readonly number[] {
+    return this.native ? [this.logical.inheritedFd, this.native.inheritedFd] : [this.logical.inheritedFd];
   }
 
   get held(): boolean {
-    return !this.#closed && this.logical.held && this.native.held;
+    return !this.#closed && this.logical.held && (this.native?.held ?? true);
   }
 
   async close(): Promise<void> {
@@ -77,8 +84,10 @@ export class SessionOwnership {
     this.#closed = true;
     const failures: unknown[] = [];
     for (const handle of [this.native, this.logical]) {
+      if (!handle) continue;
       try {
         await handle.close();
+        if (handle === this.native) await this.#closeHooks.afterNativeClose?.();
       } catch (error) {
         failures.push(error);
       }
@@ -98,8 +107,13 @@ export class OwnershipLockManager {
   }
 
   async initialize(): Promise<void> {
-    await ensurePrivateDirectory(this.root);
-    await ensurePrivateDirectory(this.locksDirectory);
+    try {
+      await ensurePrivateDirectory(this.root);
+      await ensurePrivateDirectory(this.locksDirectory);
+    } catch (error) {
+      if (errorMessage(error).startsWith("ownership_unavailable:")) throw error;
+      throw new Error("ownership_unavailable: secure ownership path validation failed");
+    }
   }
 
   lockPath(domain: OwnershipDomain, key: string): string {
@@ -111,17 +125,36 @@ export class OwnershipLockManager {
     return join(this.locksDirectory, `${domain}-${digest}.lock`);
   }
 
+  async observe(domain: OwnershipDomain, key: string): Promise<"other" | "free_or_unknown"> {
+    const path = this.lockPath(domain, key);
+    let diagnostic: unknown;
+    try {
+      diagnostic = JSON.parse((await readSecureFile(path)).toString("utf8")) as unknown;
+    } catch (error) {
+      if (String(error).includes("ENOENT")) return "free_or_unknown";
+      return "free_or_unknown";
+    }
+    if (!isRecord(diagnostic) || diagnostic.domain !== domain || diagnostic.key !== key) return "free_or_unknown";
+    if (typeof diagnostic.releasedAt === "string" || !Number.isSafeInteger(diagnostic.pid)) return "free_or_unknown";
+    try {
+      process.kill(diagnostic.pid as number, 0);
+      return "other";
+    } catch {
+      return "free_or_unknown";
+    }
+  }
+
   async acquire(
     domain: OwnershipDomain,
     key: string,
     diagnostic: OwnershipDiagnostic = {},
   ): Promise<OwnershipLockHandle> {
-    await this.initialize();
-    await assertPrivateDirectory(this.locksDirectory);
-    const path = this.lockPath(domain, key);
-    await assertNoSymlinkComponents(path, { allowMissing: true });
     let file: FileHandle | undefined;
     try {
+      await this.initialize();
+      await assertPrivateDirectory(this.locksDirectory);
+      const path = this.lockPath(domain, key);
+      await assertNoSymlinkComponents(path, { allowMissing: true });
       file = await open(
         path,
         constants.O_RDWR | constants.O_CREAT | (constants.O_NOFOLLOW ?? 0),
@@ -141,8 +174,8 @@ export class OwnershipLockManager {
     } catch (error) {
       await file?.close().catch(() => undefined);
       const message = errorMessage(error);
-      if (/^(session_in_use|native_session_in_use|migration_blocked|ownership_unavailable|unsafe_path):/.test(message)) throw error;
-      throw new Error(`ownership_unavailable: ${domain}:${key}: ${message}`);
+      if (/^(session_in_use|native_session_in_use|migration_blocked|ownership_unavailable):/.test(message)) throw error;
+      throw new Error(`ownership_unavailable: ${domain}:${key}`);
     }
   }
 
@@ -246,6 +279,23 @@ async function writeDiagnostic(
   await file.truncate(0);
   await file.write(bytes, 0, bytes.length, 0);
   await file.sync();
+}
+
+async function writeReleasedDiagnostic(file: FileHandle, domain: OwnershipDomain, key: string): Promise<void> {
+  const bytes = Buffer.from(`${JSON.stringify({
+    version: 1,
+    domain,
+    key,
+    pid: process.pid,
+    releasedAt: new Date().toISOString(),
+  })}\n`);
+  await file.truncate(0);
+  await file.write(bytes, 0, bytes.length, 0);
+  await file.sync();
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function isContention(error: unknown): boolean {

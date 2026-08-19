@@ -83,6 +83,14 @@
 - Step 4对接：server factory需注入`SessionRecordStore`/`OwnershipLockManager`并启动migration；status需动态list磁盘；remote current/last wait与README/config/tool error文案待完成。
 - 剩余边界：声明矩阵的跨Node/平台clean-install与真实Pi 0.84.1集成尚未完成；orphan Pi fail-closed与恶意同UID/网络文件系统仍是spec边界。
 
+## Step 4–5 完成: production wiring 与对抗审查
+- 默认canonical root统一为`~/.pi/agent-mcp`；production factory接入secure directories、records、ownership、ordered migration与五工具。已知caller-specific legacy root会给升级指导，任意显式custom root保持隔离。
+- status与wait改为动态磁盘视图；remote wait固定绑定精确current/last record，ownership下只reconcile目标task；identity-less error可logical-only close，有native identity时仍强制actual-native fencing。
+- 生命周期通过per-resident queue、monotonic close、releasePromise与uncertain exact-success adoption闭合exit/fail/close/wait/release及双fsync竞态。真实双stdio进程测试覆盖并行session、contention、wait、正常接手与close。
+- 两路独立review经多轮修复后最终均为0 Blocker/0 Major：API/migration gate `9dc66067` PASS；ownership gate `eab68733` PASS。完整轨迹见`ai/scratch/shared-session-registry-v2/step5-*.md`。
+- 剩余Minor：同一Server在preserved release窗口同时收到close与send时，send可能返回`session_in_use`而非`session_closed`；close仍durable且无提前release、双写或数据损坏。
+- Step 5主会话focused验收最高120/120全量通过前的定向矩阵均通过；Step 6仍需最终独立全量、pack、真实Pi smoke与归档回写。
+
 ## 踩坑记录
 
 （Sprint 结束时提取。）

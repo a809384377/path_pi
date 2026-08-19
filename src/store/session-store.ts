@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { readdir } from "node:fs/promises";
 import { isAbsolute, basename, join, resolve } from "node:path";
-import { assertPrivateDirectory, ensurePrivateDirectory, publishNoReplace, readSecureFile, replaceAtomic } from "./secure-fs.js";
+import { isDeepStrictEqual } from "node:util";
+import { assertPrivateDirectory, atomicWriteWasPublished, ensurePrivateDirectory, publishNoReplace, readSecureFile, replaceAtomic, syncDirectory, type AtomicWriteHooks } from "./secure-fs.js";
 import type { StoredTask, StoredTaskStatus } from "./legacy-session-store.js";
 
 export {
@@ -40,11 +41,32 @@ export interface SessionRecordV2 {
   updatedAt: string;
 }
 
+export interface SessionRecordStoreOptions {
+  createHooks?: AtomicWriteHooks;
+  updateHooks?: AtomicWriteHooks;
+  reconciliationSyncHook?: () => Promise<void> | void;
+}
+
+export class RecordDurabilityUncertainError extends Error {
+  readonly record: SessionRecordV2;
+
+  constructor(record: SessionRecordV2, error: unknown) {
+    super(`record_durability_uncertain: ${record.sessionId}: ${errorMessage(error)}`, { cause: error });
+    this.name = "RecordDurabilityUncertainError";
+    this.record = structuredClone(record);
+  }
+}
+
+export function isRecordDurabilityUncertain(error: unknown): error is RecordDurabilityUncertainError {
+  return error instanceof RecordDurabilityUncertainError;
+}
+
 export interface SessionRecordStoreApi {
   create(record: SessionRecordV2): Promise<void>;
   read(sessionId: string): Promise<SessionRecordV2>;
   updateOwned(sessionId: string, expectedRevision: number, next: SessionRecordV2): Promise<void>;
   list(): Promise<SessionRecordV2[]>;
+  findTaskRecords(taskIds: readonly string[]): Promise<Map<string, SessionRecordV2>>;
   drain(sessionId?: string): Promise<void>;
 }
 
@@ -52,13 +74,16 @@ export class SessionRecordStore implements SessionRecordStoreApi {
   readonly root: string;
   readonly sessionsDirectory: string;
   readonly temporaryDirectory: string;
+  readonly #options: SessionRecordStoreOptions;
+  readonly #uncertain = new Map<string, SessionRecordV2>();
   readonly #chains = new Map<string, Promise<void>>();
 
-  constructor(root: string) {
+  constructor(root: string, options: SessionRecordStoreOptions = {}) {
     if (!isAbsolute(root)) throw new Error(`unsafe_path: state root must be absolute: ${root}`);
     this.root = resolve(root);
     this.sessionsDirectory = join(this.root, "sessions");
     this.temporaryDirectory = join(this.root, "tmp");
+    this.#options = options;
   }
 
   recordPath(sessionId: string): string {
@@ -72,16 +97,14 @@ export class SessionRecordStore implements SessionRecordStoreApi {
 
   async read(sessionId: string): Promise<SessionRecordV2> {
     const path = this.recordPath(sessionId);
-    let content: string;
     try {
       await assertPrivateDirectory(this.root);
       await assertPrivateDirectory(this.sessionsDirectory);
-      content = (await readSecureFile(path)).toString("utf8");
+      return await readRecordFileWithRetry(path, sessionId);
     } catch (error) {
       if (String(error).includes("ENOENT")) throw new Error(`unknown_session: ${sessionId}`);
       throw error;
     }
-    return parseRecordFile(path, content, sessionId);
   }
 
   updateOwned(sessionId: string, expectedRevision: number, next: SessionRecordV2): Promise<void> {
@@ -105,10 +128,35 @@ export class SessionRecordStore implements SessionRecordStoreApi {
     }
     const paths = entries.filter((name) => name.endsWith(".json")).sort().map((name) => join(this.sessionsDirectory, name));
     const records: SessionRecordV2[] = [];
-    for (const path of paths) {
-      records.push(parseRecordFile(path, (await readSecureFile(path)).toString("utf8")));
-    }
+    for (const path of paths) records.push(await readRecordFileWithRetry(path));
     return records;
+  }
+
+  async findTaskRecords(taskIds: readonly string[]): Promise<Map<string, SessionRecordV2>> {
+    const wanted = new Set(taskIds);
+    const found = new Map<string, SessionRecordV2>();
+    let entries: string[];
+    try {
+      await assertPrivateDirectory(this.root);
+      await assertPrivateDirectory(this.sessionsDirectory);
+      entries = await readdir(this.sessionsDirectory);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return found;
+      throw error;
+    }
+    for (const name of entries.filter((entry) => entry.endsWith(".json")).sort()) {
+      let record: SessionRecordV2;
+      try {
+        record = await readRecordFileWithRetry(join(this.sessionsDirectory, name));
+      } catch {
+        continue;
+      }
+      for (const taskId of wanted) {
+        if (record.activeTaskId === taskId || record.lastTask?.taskId === taskId) found.set(taskId, record);
+      }
+      if (found.size === wanted.size) break;
+    }
+    return found;
   }
 
   async drain(sessionId?: string): Promise<void> {
@@ -121,10 +169,16 @@ export class SessionRecordStore implements SessionRecordStoreApi {
 
   async #create(record: SessionRecordV2): Promise<void> {
     await this.#ensureDirectories();
+    if (await this.#finishUncertain(record)) return;
     const finalPath = this.recordPath(record.sessionId);
+    const bytes = serializeRecord(record);
     try {
-      await publishNoReplace(finalPath, serializeRecord(record));
+      await publishNoReplace(finalPath, bytes, this.#options.createHooks);
     } catch (error) {
+      if (atomicWriteWasPublished(error) && await finalRecordExactlyMatches(finalPath, record)) {
+        await this.#reconcilePublished(record);
+        return;
+      }
       if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`session_exists: ${record.sessionId}`);
       throw error;
     }
@@ -132,6 +186,7 @@ export class SessionRecordStore implements SessionRecordStoreApi {
 
   async #update(sessionId: string, expectedRevision: number, next: SessionRecordV2): Promise<void> {
     await this.#ensureDirectories();
+    if (await this.#finishUncertain(next)) return;
     const current = await this.read(sessionId);
     if (current.revision !== expectedRevision) {
       throw new Error(`revision_conflict: ${sessionId} expected ${expectedRevision}, found ${current.revision}`);
@@ -140,7 +195,47 @@ export class SessionRecordStore implements SessionRecordStoreApi {
       throw new Error(`migration_provenance_immutable: ${sessionId}`);
     }
     const finalPath = this.recordPath(sessionId);
-    await replaceAtomic(finalPath, serializeRecord(next));
+    try {
+      await replaceAtomic(finalPath, serializeRecord(next), this.#options.updateHooks);
+    } catch (error) {
+      if (atomicWriteWasPublished(error) && await finalRecordExactlyMatches(finalPath, next)) {
+        await this.#reconcilePublished(next);
+        return;
+      }
+      throw error;
+    }
+  }
+
+  async #finishUncertain(intended: SessionRecordV2): Promise<boolean> {
+    const uncertain = this.#uncertain.get(intended.sessionId);
+    if (!uncertain) return false;
+    if (!(await finalRecordExactlyMatches(this.recordPath(intended.sessionId), uncertain))) {
+      this.#uncertain.delete(intended.sessionId);
+      throw new Error(`revision_conflict: ${intended.sessionId} uncertain final changed`);
+    }
+    await this.#syncReconciled(uncertain);
+    this.#uncertain.delete(intended.sessionId);
+    return isDeepStrictEqual(uncertain, intended);
+  }
+
+  async #reconcilePublished(intended: SessionRecordV2): Promise<void> {
+    try {
+      await this.#syncReconciled(intended);
+    } catch (error) {
+      this.#uncertain.set(intended.sessionId, structuredClone(intended));
+      throw new RecordDurabilityUncertainError(intended, error);
+    }
+  }
+
+  async #syncReconciled(intended: SessionRecordV2): Promise<void> {
+    try {
+      await this.#options.reconciliationSyncHook?.();
+      await syncDirectory(this.sessionsDirectory);
+    } catch (error) {
+      this.#uncertain.set(intended.sessionId, structuredClone(intended));
+      if (isRecordDurabilityUncertain(error)) throw error;
+      throw new RecordDurabilityUncertainError(intended, error);
+    }
   }
 
   async #ensureDirectories(): Promise<void> {
@@ -177,7 +272,11 @@ export function validateSessionRecord(value: unknown): SessionRecordV2 {
   if (typeof value.state !== "string" || !states.has(value.state as SessionRecordState)) {
     throw new Error(`Invalid state for ${value.sessionId}`);
   }
-  if (typeof value.recoverable !== "boolean" || !(value.activeTaskId === null || typeof value.activeTaskId === "string")) {
+  if (
+    typeof value.recoverable !== "boolean" ||
+    !(value.activeTaskId === null || typeof value.activeTaskId === "string" && value.activeTaskId.length > 0) ||
+    value.state === "running" && typeof value.activeTaskId !== "string"
+  ) {
     throw new Error(`Invalid lifecycle for ${value.sessionId}`);
   }
   if (typeof value.updatedAt !== "string") throw new Error(`Invalid updatedAt for ${value.sessionId}`);
@@ -187,7 +286,9 @@ export function validateSessionRecord(value: unknown): SessionRecordV2 {
   }
   for (const key of ["name", "model", "piSessionId", "sessionFile"] as const) {
     const field = value[key];
-    if (field !== undefined && typeof field !== "string") throw new Error(`Invalid ${key} for ${value.sessionId}`);
+    if (field !== undefined && (typeof field !== "string" || field.length === 0)) {
+      throw new Error(`Invalid ${key} for ${value.sessionId}`);
+    }
   }
   const sessionFile = value.sessionFile;
   if (sessionFile !== undefined && (typeof sessionFile !== "string" || !isAbsolute(sessionFile))) {
@@ -195,6 +296,21 @@ export function validateSessionRecord(value: unknown): SessionRecordV2 {
   }
   if (value.recoverable && (typeof value.piSessionId !== "string" || typeof value.sessionFile !== "string")) {
     throw new Error(`Recoverable session ${value.sessionId} lacks Pi identity`);
+  }
+  if (value.state === "closed" && (value.recoverable || value.activeTaskId !== null)) {
+    throw new Error(`Invalid closed lifecycle for ${value.sessionId}`);
+  }
+  if (value.activeTaskId !== null && value.state !== "creating" && value.state !== "running") {
+    throw new Error(`Active task requires creating or running state for ${value.sessionId}`);
+  }
+  if (value.state === "creating" && (value.recoverable || typeof value.piSessionId !== "string")) {
+    throw new Error(`Invalid creating lifecycle for ${value.sessionId}`);
+  }
+  if (value.state === "creating" && value.activeTaskId === null) {
+    throw new Error(`Creating session ${value.sessionId} lacks an active task`);
+  }
+  if (["dormant", "idle"].includes(String(value.state)) && !value.recoverable) {
+    throw new Error(`Established session ${value.sessionId} must be recoverable`);
   }
   if (value.lastTask !== undefined) validateStoredTask(value.lastTask, value.sessionId);
   if (value.migration !== undefined) validateMigration(value.migration, value.sessionId);
@@ -208,6 +324,29 @@ export function recordsHaveSameImmutableIdentity(left: SessionRecordV2, right: S
     left.sessionFile === right.sessionFile &&
     sameMigrationProvenance(left.migration, right.migration)
   );
+}
+
+async function readRecordFileWithRetry(path: string, expectedSessionId?: string): Promise<SessionRecordV2> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      return parseRecordFile(path, (await readSecureFile(path, { requireMode: 0o600, requireCurrentUid: true })).toString("utf8"), expectedSessionId);
+    } catch (error) {
+      lastError = error;
+      if (!/unsafe_file_identity|ENOENT/.test(errorMessage(error))) throw error;
+      await new Promise((resolveRetry) => setTimeout(resolveRetry, 1));
+    }
+  }
+  throw lastError;
+}
+
+async function finalRecordExactlyMatches(path: string, intended: SessionRecordV2): Promise<boolean> {
+  try {
+    const actual = await readRecordFileWithRetry(path, intended.sessionId);
+    return isDeepStrictEqual(actual, intended);
+  } catch {
+    return false;
+  }
 }
 
 function parseRecordFile(path: string, content: string, expectedSessionId?: string): SessionRecordV2 {

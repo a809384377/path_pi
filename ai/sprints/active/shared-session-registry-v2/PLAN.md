@@ -23,17 +23,17 @@
 - 内容: 每 session 单 owner；占用、续持、释放和 stale recovery；恢复前确认 ownership；状态查询不抢锁
 - 验证: 两进程竞争同 session 只有一个成功；正常退出后可接手；异常 owner 不会造成自动双写
 
-## Step 4: 接入统一默认目录并保持五工具 API [wip]
+## Step 4: 接入统一默认目录并保持五工具 API [done]
 - 涉及: `src/server.ts`、MCP schemas、README、配置示例
 - 内容: Claude/Codex 共用默认目录，不再要求调用方拆分目录；保留 spawn/send/wait/status/close 契约并补充 `session_in_use` 说明
 - 验证: 两个真实 stdio MCP Server 在同一临时 root 下并行使用不同 session；接手流程通过
 
-## Step 5: 独立对抗审查与修复 [ ]
+## Step 5: 独立对抗审查与修复 [done]
 - 涉及: 完整 diff、review artifacts、必要修复
 - 内容: 攻击 TOCTOU、PID/锁复用、owner crash、迁移并发、record 损坏、close/restore 竞态和兼容回归
 - 验证: fresh reviewers 无未处理 Blocker/Major
 
-## Step 6: 最终验收与 Sprint 收尾 [ ]
+## Step 6: 最终验收与 Sprint 收尾 [wip]
 - 涉及: 全仓、ROADMAP/KNOWLEDGE、Sprint 归档
 - 内容: typecheck、全量 test、多进程 E2E、pack、关键不变式复核、版本与文档回写
 - 验证: 成功标准全部举证，Git 干净，Sprint 归档

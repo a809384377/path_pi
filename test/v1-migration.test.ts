@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
 import { access, chmod, lstat, mkdir, mkdtemp, readFile, readdir, rename, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import test from "node:test";
 import { SessionRecordStore, type SessionRecordV2 } from "../src/store/session-store.js";
 import type { SessionManifest, StoredSession } from "../src/store/legacy-session-store.js";
@@ -96,6 +96,10 @@ test("V1SessionMigrator cleanly migrates, retires source, and reruns idempotentl
   assert.equal(first.status, "migrated");
   if (!("retiredPath" in first)) assert.fail("missing retired path");
   await access(first.retiredPath);
+  assert.equal(
+    basename(first.retiredPath),
+    `sessions.v1.retired-${createHash("sha256").update(await readFile(first.retiredPath)).digest("hex")}.json`,
+  );
   await assert.rejects(access(h.sourcePath));
 
   const record = await h.store.read("alpha");
@@ -645,3 +649,24 @@ async function writeFileEnsuringParent(path: string, content: string): Promise<v
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, content);
 }
+
+test("V1SessionMigrator resumes legacy UUID quarantine intents while new migrations use retired hashes", async () => {
+  const h = await harness();
+  await writeManifest(h, true);
+  const crashing = migrator(h, {
+    root: h.root,
+    recordStore: h.store,
+    hooks: { beforeSourceTransition: () => { throw new Error("pause before legacy retirement"); } },
+  });
+  await assert.rejects(crashing.migrateSource(h.sourcePath), /pause before legacy retirement/);
+  const transaction = await onlyTransactionDirectory(h.root);
+  const intentPath = join(transaction, "intent.json");
+  const intent = JSON.parse(await readFile(intentPath, "utf8")) as Record<string, any>;
+  intent.quarantinePath = join(dirname(intent.sourcePath), `sessions.v1.quarantine-${intent.migrationId}-legacy-uuid.json`);
+  await writeFile(intentPath, `${JSON.stringify(intent, null, 2)}\n`);
+
+  const outcomes = await migrator(h).resumeIncomplete();
+  assert.equal(outcomes[0]?.status, "resumed");
+  assert.equal(outcomes[0]?.retiredPath, intent.quarantinePath);
+  await access(intent.quarantinePath);
+});
