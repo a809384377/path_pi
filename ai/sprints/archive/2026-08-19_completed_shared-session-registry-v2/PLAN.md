@@ -33,7 +33,7 @@
 - 内容: 攻击 TOCTOU、PID/锁复用、owner crash、迁移并发、record 损坏、close/restore 竞态和兼容回归
 - 验证: fresh reviewers 无未处理 Blocker/Major
 
-## Step 6: 最终验收与 Sprint 收尾 [wip]
+## Step 6: 最终验收与 Sprint 收尾 [done]
 - 涉及: 全仓、ROADMAP/KNOWLEDGE、Sprint 归档
 - 内容: typecheck、全量 test、多进程 E2E、pack、关键不变式复核、版本与文档回写
 - 验证: 成功标准全部举证，Git 干净，Sprint 归档

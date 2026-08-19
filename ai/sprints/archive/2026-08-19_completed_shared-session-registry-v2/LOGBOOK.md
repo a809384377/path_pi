@@ -1,6 +1,6 @@
 # 日志
 
-## 状态: active
+## 状态: completed
 
 ---
 
@@ -93,4 +93,29 @@
 
 ## 踩坑记录
 
-（Sprint 结束时提取。）
+（无新增可跨项目复用的原则级条目。）
+
+---
+
+## Sprint 总结
+
+### 状态: completed
+### 周期: 2026-08-18 -> 2026-08-19
+
+### 目标与结果
+| 成功标准 | 结果 |
+|---------|------|
+| 所有调用方默认共用统一状态根目录 | pass — 默认`~/.pi/agent-mcp`，已知旧caller-specific root给出升级指导 |
+| session元数据按session独立持久化 | pass — v2 final records与独立atomic mutation |
+| 两个MCP Server进程并行运行不同session | pass — production entrypoint双stdio E2E且无record丢失 |
+| 同logical/native session同时单owner | pass — kernel logical+actual-native locks，50进程仅1个成功 |
+| 正常退出后另一调用方恢复原生history | pass — graceful takeover保持native ID/path/history |
+| 异常退出安全fail-closed与回收 | pass — inherited fd在parent SIGKILL后继续fence，Pi退出后释放 |
+| v0.1.0 manifest幂等无损迁移 | pass — source-atomic retirement、intent/receipt resume、dirty attestation与conflict policy |
+| 五工具、wait、懒恢复、进程组清理不退化 | pass — exact schema snapshot、动态status/current-last wait和lifecycle regressions |
+| 多进程、typecheck、全量测试与独立终审 | pass — 120/120、pack/clean-install/Pi smoke；最终0 Blocker/0 Major |
+
+### 后续注意事项
+- 同一Server在preserved release窗口同时收到`close`与`send`时，`send`可能返回`session_in_use`而非`session_closed`；close仍durable，无双写或数据损坏。
+- 当前本机验证覆盖Darwin arm64 / Node 23.11.0；macOS/Linux x64/arm64与Node 22–25完整clean-install组合仍由发布CI矩阵承担。
+- orphan Pi长期存活会按设计持续持锁，需人工终止对应process group；不得删除稳定lock file。
