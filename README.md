@@ -1,6 +1,33 @@
-# pi-agent-mcp
+# path_pi
 
-`pi-agent-mcp` exposes reusable [Pi](https://github.com/badlogic/pi-mono) coding-agent sessions to Claude Code, Codex, and other MCP clients.
+我的公开 Pi 配置、Agent Skills 与集成工具集。目前仓库的核心是 `pi-agent-mcp`：Claude Code、Codex 等 MCP Host 可以把独立任务派给多个持久、可继续复用上下文的 [Pi](https://github.com/badlogic/pi-mono) session。
+
+## 仓库内容
+
+```text
+skills/pi-agent/       # Claude Code/Codex 调用 MCP 的 Agent Skill
+src/                   # pi-agent-mcp TypeScript 源码
+scripts/install.sh     # 构建并配置 Skill + MCP Host
+examples/              # 不含真实凭据的 Pi 配置样例
+docs/INSTALL.zh-CN.md  # 中文安装、认证、升级与卸载指南
+```
+
+## 快速安装
+
+```sh
+git clone https://github.com/a809384377/path_pi.git
+cd path_pi
+./scripts/install.sh             # 自动配置检测到的 Claude Code/Codex
+# 或：./scripts/install.sh --host claude|codex|all
+```
+
+要求 Node.js `>=22.19 <26`、Pi `0.84.1` 或兼容版本，以及至少一个已认证的 Pi 模型。完整步骤见 **[中文安装与认证指南](docs/INSTALL.zh-CN.md)**。
+
+> 仓库只提供脱敏样例，不包含本机 `auth.json`、真实 `models.json`、API key、GitHub token 或 Pi session。不要将这些私有文件复制进公开仓库。
+
+## pi-agent-mcp
+
+`pi-agent-mcp` exposes reusable Pi coding-agent sessions to Claude Code, Codex, and other MCP clients.
 
 Claude Code, Codex, and other local MCP hosts share one registry by default at `~/.pi/agent-mcp/`. Each logical session has an independent durable record and kernel-backed logical/native ownership locks, so different MCP servers can work on different sessions concurrently without overwriting registry state.
 
@@ -29,9 +56,9 @@ The MCP entry point is `dist/src/index.js`. The server uses stdio: stdout is res
 Register the built server with an absolute path. Do not set a caller-specific state directory for normal shared use:
 
 ```sh
-claude mcp add --transport stdio \
-  --env PI_AGENT_MCP_PI_EXECUTABLE=/opt/homebrew/bin/pi \
-  pi-agent -- node /absolute/path/to/pi-agent-mcp/dist/src/index.js
+claude mcp add --scope user --transport stdio \
+  --env "PI_AGENT_MCP_PI_EXECUTABLE=$(command -v pi)" \
+  pi-agent -- "$(command -v node)" "/absolute/path/to/path_pi/dist/src/index.js"
 ```
 
 ## Configure Codex
@@ -40,11 +67,11 @@ Add the same server to `~/.codex/config.toml`, also without a state-directory ov
 
 ```toml
 [mcp_servers.pi_agent]
-command = "node"
-args = ["/absolute/path/to/pi-agent-mcp/dist/src/index.js"]
+command = "/absolute/path/to/node"
+args = ["/absolute/path/to/path_pi/dist/src/index.js"]
 
 [mcp_servers.pi_agent.env]
-PI_AGENT_MCP_PI_EXECUTABLE = "/opt/homebrew/bin/pi"
+PI_AGENT_MCP_PI_EXECUTABLE = "/absolute/path/to/pi"
 ```
 
 Both clients now discover the same sessions through `~/.pi/agent-mcp/`. They may run tasks on different sessions in parallel. Only one MCP server may own a particular logical or native Pi session at a time.
@@ -69,7 +96,7 @@ If a v1 manifest has `cleanShutdown: false`, startup returns `legacy_state_uncer
 
 ## Tools
 
-The public API remains exactly five tools with the existing input shapes.
+The public API remains exactly five tools; `pi_wait` intentionally no longer accepts a timeout because it waits for a terminal condition.
 
 ### `pi_spawn`
 
@@ -114,15 +141,15 @@ Waits for exact current or last task IDs:
 ```json
 {
   "task_ids": ["task_a", "task_b", "task_c"],
-  "mode": "any",
-  "timeout_seconds": 60
+  "mode": "any"
 }
 ```
 
-- `mode: "any"` returns when at least one requested task is terminal.
-- `mode: "all"` returns when every requested task is terminal.
-- A timeout returns the terminal subset plus truthful `pending`; it does not cancel tasks.
-- Local waits are event-driven. Cross-server waits poll the durable current/last slots for at most the requested timeout.
+- `mode: "any"` returns when at least one requested task is terminal; `pending` lists the requested tasks that are still running.
+- `mode: "all"` returns when every requested task is terminal; `pending` is empty.
+- `pi_wait` is a true terminal wait: the MCP request remains open until the requested condition is met. It has no application-level timeout and does not cancel the Pi task. If the MCP client cancels the request, only that observation wait stops; the Pi task continues. Claude Code may move the long-running request to its own background task and deliver the final result on that same request.
+- While waiting, the server sends a standard MCP progress heartbeat every 30 seconds when the client supplies a progress token. The heartbeat keeps clients from treating an otherwise silent terminal wait as idle; it does not return a tool result, trigger a new model turn, poll Pi, or change task state.
+- Local waits are event-driven. Cross-server waits re-check the durable current/last slots while the same request remains open.
 - Terminal states are `completed`, `failed`, `aborted`, and `host_interrupted`.
 - If a free active record is left by a dead host, a waiter may acquire full ownership and publish `host_interrupted` without starting Pi. If an orphan Pi still holds locks, the task remains pending.
 - Once a later task overwrites the record's last-task slot, the older ID returns `unknown_task`; there is no task-history registry.
@@ -215,4 +242,4 @@ npm test
 npm pack --dry-run
 ```
 
-Tests use temporary roots and a controllable fake Pi; they never read or write the user's real `~/.pi` data or call a model API. Coverage includes RPC framing, process-group cleanup, per-record atomicity, source-atomic migration, kernel ownership inheritance, cross-server status/wait/send/close behavior, and the unchanged five-tool MCP surface.
+Tests use temporary roots and a controllable fake Pi; they never read or write the user's real `~/.pi` data or call a model API. Coverage includes RPC framing, process-group cleanup, per-record atomicity, source-atomic migration, kernel ownership inheritance, cross-server status/wait/send/close behavior, and the five-tool MCP surface.

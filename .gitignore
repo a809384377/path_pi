@@ -8,4 +8,12 @@ coverage/
 ai/cache/
 .playwright-mcp/
 .pi/subagents/
+.pi/agent-mcp/
 .DS_Store
+
+# Never publish local credentials or private keys.
+auth.json
+models.json
+*.pem
+*.key
+secrets/

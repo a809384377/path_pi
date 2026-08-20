@@ -269,7 +269,7 @@ async function createManager(
 }
 
 async function waitTerminal(manager: SessionManager, taskId: string): Promise<void> {
-  const result = await manager.wait([taskId], "all", 2_000);
+  const result = await manager.wait([taskId], "all");
   assert.equal(result.completed.length, 1);
 }
 
@@ -387,7 +387,7 @@ test("SessionManager runs three v2 sessions concurrently without crossing result
     h.manager.spawn({ task: "B delay:10", cwd: h.cwd }),
     h.manager.spawn({ task: "C delay:25", cwd: h.cwd }),
   ]);
-  const all = await h.manager.wait([a.task_id, b.task_id, c.task_id], "all", 2_000);
+  const all = await h.manager.wait([a.task_id, b.task_id, c.task_id], "all");
   assert.equal(all.completed.length, 3);
   assert.match(all.completed.find((task) => task.task_id === a.task_id)?.response ?? "", /reply:A/);
   assert.match(all.completed.find((task) => task.task_id === c.task_id)?.response ?? "", /reply:C/);
@@ -441,7 +441,7 @@ test("second manager is fenced while resident owner holds locks and takes over a
   await assert.rejects(second.close(spawned.session_id), /session_in_use/);
   await first.manager.shutdown();
   const taken = await second.send(spawned.session_id, "second");
-  const result = await second.wait([taken.task_id], "all", 2_000);
+  const result = await second.wait([taken.task_id], "all");
   assert.match(result.completed[0]?.response ?? "", /reply:first\|second/);
   await second.shutdown();
 });
@@ -492,7 +492,7 @@ test("free established running record is safely interrupted before direct restor
 test("terminal result remains durable when the new Pi file header is invalid", async () => {
   const h = await harness({ rpcFactory: (options) => new InvalidSessionFileRpc(options) });
   const spawned = await h.manager.spawn({ task: "work", cwd: h.cwd });
-  const result = await h.manager.wait([spawned.task_id], "all", 2_000);
+  const result = await h.manager.wait([spawned.task_id], "all");
   assert.equal(result.completed[0]?.status, "completed");
   const stored = await h.store.read(spawned.session_id);
   assert.equal(stored.lastTask?.taskId, spawned.task_id);
@@ -706,7 +706,7 @@ test("terminal persistence failure retains ownership until cleanup durably succe
     },
   });
   const spawned = await manager.spawn({ task: "work", cwd });
-  const waiting = manager.wait([spawned.task_id], "all", 1_000);
+  const waiting = manager.wait([spawned.task_id], "all");
   store.failNextUpdate = true;
   rpc!.emit("event", { type: "agent_settled" });
   await assert.rejects(waiting, /persistence_error.*disk full/);
@@ -734,7 +734,7 @@ test("failed shutdown cleanup is retryable without reopening admission or losing
     },
   });
   const spawned = await manager.spawn({ task: "work", cwd });
-  const waiting = manager.wait([spawned.task_id], "all", 1_000);
+  const waiting = manager.wait([spawned.task_id], "all");
   store.failUpdateCount = 2;
   rpc!.emit("event", { type: "agent_settled" });
   await assert.rejects(waiting, /persistence_error.*disk full/);
@@ -911,7 +911,7 @@ test("remote wait polls fixed target records and ignores unrelated corruption", 
   const corruptPath = join(h.store.sessionsDirectory, `${sessionRecordHash("pi_unrelated_corrupt")}.json`);
   await writeFile(corruptPath, "{broken", { mode: 0o600 });
   const manager = await createManager(h.store, new OwnershipLockManager(h.root));
-  const result = await manager.wait(["task_wait_first", "task_wait_second"], "all", 1_000);
+  const result = await manager.wait(["task_wait_first", "task_wait_second"], "all");
   assert.deepEqual(result.completed.map((task) => task.task_id).sort(), ["task_wait_first", "task_wait_second"]);
   assert.ok(result.completed.every((task) => task.status === "host_interrupted"));
   await manager.shutdown();
@@ -994,7 +994,7 @@ test("remote wait reconciliation and same-manager close share lifecycle ownershi
   const manager = await createManager(store, new OwnershipLockManager(root));
   const reconcileGate = new DeferredGate();
   store.updateGate = reconcileGate;
-  const waiting = manager.wait(["task_wait_close"], "all", 1_000);
+  const waiting = manager.wait(["task_wait_close"], "all");
   await reconcileGate.entered;
   const closing = manager.close(sessionId);
   const contender = new OwnershipLockManager(root);
@@ -1035,7 +1035,7 @@ test("remote wait rejects a task overwritten after discovery without mutating it
     updatedAt: now,
   });
   const manager = await createManager(store, new OwnershipLockManager(root));
-  const waiting = manager.wait(["task_obsolete"], "all", 1_000);
+  const waiting = manager.wait(["task_obsolete"], "all");
   await discoveryGate.entered;
   const writer = new SessionRecordStore(root);
   const initial = await writer.read(sessionId);
@@ -1065,7 +1065,7 @@ test("stale non-owned local task mapping cannot authorize remote wait reconcilia
     updatedAt: new Date().toISOString(),
   };
   await writer.updateOwned(spawned.session_id, dormant.revision, successor);
-  await assert.rejects(h.manager.wait([spawned.task_id], "all", 100), /unknown_task/);
+  await assert.rejects(h.manager.wait([spawned.task_id], "all"), /unknown_task/);
   assert.deepEqual(await writer.read(spawned.session_id), successor);
   assert.equal(rpc!.processOwned, false);
 });
@@ -1097,11 +1097,11 @@ test("mixed local and remote waits preserve any and all semantics", async () => 
     },
     updatedAt: now,
   });
-  const any = await h.manager.wait([local.task_id, "task_mixed_remote"], "any", 0);
+  const any = await h.manager.wait([local.task_id, "task_mixed_remote"], "any");
   assert.deepEqual(any.completed.map((task) => task.task_id), ["task_mixed_remote"]);
   assert.deepEqual(any.pending, [local.task_id]);
   rpc!.emit("event", { type: "agent_settled" });
-  const all = await h.manager.wait([local.task_id, "task_mixed_remote"], "all", 1_000);
+  const all = await h.manager.wait([local.task_id, "task_mixed_remote"], "all");
   assert.deepEqual(all.completed.map((task) => task.task_id).sort(), [local.task_id, "task_mixed_remote"].sort());
   assert.deepEqual(all.pending, []);
   await h.manager.shutdown();
@@ -1127,7 +1127,7 @@ test("manager adopts an uncertain published revision before cleanup retry", asyn
   });
   const spawned = await manager.spawn({ task: "work", cwd });
   armed = true;
-  const waiting = manager.wait([spawned.task_id], "all", 1_000);
+  const waiting = manager.wait([spawned.task_id], "all");
   rpc!.emit("event", { type: "agent_settled" });
   await assert.rejects(waiting, /persistence_error.*record_durability_uncertain/);
   const uncertain = await store.read(spawned.session_id);

@@ -1,0 +1,19 @@
+{
+  "providers": {
+    "example-openai-compatible": {
+      "baseUrl": "https://api.example.com/v1",
+      "api": "openai-completions",
+      "apiKey": "$EXAMPLE_API_KEY",
+      "models": [
+        {
+          "id": "example-model",
+          "name": "Example Model",
+          "reasoning": true,
+          "input": ["text"],
+          "contextWindow": 128000,
+          "maxTokens": 16384
+        }
+      ]
+    }
+  }
+}

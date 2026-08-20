@@ -35,6 +35,14 @@
     "coding-agent",
     "subagent"
   ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/a809384377/path_pi.git"
+  },
+  "homepage": "https://github.com/a809384377/path_pi#readme",
+  "bugs": {
+    "url": "https://github.com/a809384377/path_pi/issues"
+  },
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",

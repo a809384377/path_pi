@@ -89,7 +89,17 @@ export async function createServerRuntime(
   return { server, manager, stateRoot: configuration.stateRoot, migrationOutcomes };
 }
 
-export function registerTools(server: McpServer, manager: SessionManager): void {
+export interface ToolRegistrationOptions {
+  waitHeartbeatMs?: number;
+}
+
+const defaultWaitHeartbeatMs = 30_000;
+
+export function registerTools(
+  server: McpServer,
+  manager: SessionManager,
+  options: ToolRegistrationOptions = {},
+): void {
   server.registerTool(
     "pi_spawn",
     {
@@ -130,15 +140,18 @@ export function registerTools(server: McpServer, manager: SessionManager): void 
     "pi_wait",
     {
       description:
-        "Wait for any or all background Pi tasks by immutable task_id. Results are observational and may be read repeatedly. A timeout does not fail or cancel tasks.",
+        "Wait for any or all background Pi tasks by immutable task_id. This request remains open until the requested terminal condition is met; it never times out or cancels tasks. For mode=any, completed contains the terminal tasks observed when the first task finishes and pending contains the rest.",
       inputSchema: {
         task_ids: z.array(z.string().min(1)).min(1),
         mode: z.enum(["any", "all"]).default("any"),
-        timeout_seconds: z.number().min(0).max(300).default(60),
       },
     },
-    async ({ task_ids, mode, timeout_seconds }) =>
-      toolResult(() => manager.wait(task_ids, mode, Math.round(timeout_seconds * 1_000))),
+    async ({ task_ids, mode }, extra) =>
+      toolResult(() => waitWithProgress(
+        () => manager.wait(task_ids, mode, extra.signal),
+        extra,
+        options.waitHeartbeatMs ?? defaultWaitHeartbeatMs,
+      )),
   );
 
   server.registerTool(
@@ -196,6 +209,42 @@ export async function runStdioServer(): Promise<void> {
   process.stdin.once("close", handleInputEnd);
   transport.onclose = handleInputEnd;
   await server.connect(transport);
+}
+
+async function waitWithProgress<T>(
+  operation: () => Promise<T>,
+  extra: {
+    signal: AbortSignal;
+    _meta?: { progressToken?: string | number | undefined };
+    sendNotification: (notification: {
+      method: "notifications/progress";
+      params: { progressToken: string | number; progress: number; message: string };
+    }) => Promise<void>;
+  },
+  heartbeatMs: number,
+): Promise<T> {
+  const progressToken = extra._meta?.progressToken;
+  if (progressToken === undefined || heartbeatMs <= 0) return operation();
+
+  let progress = 0;
+  const timer = setInterval(() => {
+    progress += 1;
+    void extra.sendNotification({
+      method: "notifications/progress",
+      params: {
+        progressToken,
+        progress,
+        message: "Waiting for Pi task terminal state",
+      },
+    }).catch(() => undefined);
+  }, heartbeatMs);
+  timer.unref();
+
+  try {
+    return await operation();
+  } finally {
+    clearInterval(timer);
+  }
 }
 
 async function toolResult<T>(operation: () => Promise<T>): Promise<{

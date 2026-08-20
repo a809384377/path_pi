@@ -20,9 +20,17 @@ function runtimeEnv(root?: string): NodeJS.ProcessEnv {
 }
 
 async function waitTerminal(runtime: Awaited<ReturnType<typeof createServerRuntime>>, taskId: string) {
-  const result = await runtime.manager.wait([taskId], "all", 3_000);
+  const result = await runtime.manager.wait([taskId], "all");
   assert.equal(result.completed.length, 1);
   return result.completed[0]!;
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("Timed out waiting for condition");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
 }
 
 function legacySession(sessionId: string, cwd: string, overrides: Partial<StoredSession> = {}): StoredSession {
@@ -171,7 +179,7 @@ test("independent runtimes share records, status, waits, takeover, contention, a
   const second = await createServerRuntime(runtimeEnv(root), directory);
   try {
     const [fromFirst, fromSecond] = await Promise.all([
-      first.manager.spawn({ task: "first delay:80", cwd: directory }),
+      first.manager.spawn({ task: "first delay:300", cwd: directory }),
       second.manager.spawn({ task: "second delay:25", cwd: directory }),
     ]);
 
@@ -179,12 +187,16 @@ test("independent runtimes share records, status, waits, takeover, contention, a
     assert.equal(seenBySecond.resident, "unknown");
     assert.equal(seenBySecond.ownership, "other");
     assert.equal(seenBySecond.current_task_id, fromFirst.task_id);
-    const pending = await second.manager.wait([fromFirst.task_id], "all", 0);
-    assert.deepEqual(pending.pending, [fromFirst.task_id]);
-    assert.equal(pending.timed_out, true);
+    const remoteWaitAbort = new AbortController();
+    const cancelledRemoteWait = second.manager.wait([fromFirst.task_id], "all", remoteWaitAbort.signal);
+    await waitFor(() => second.manager.listenerCount("taskTerminal") === 1);
+    remoteWaitAbort.abort(new Error("cancel remote wait"));
+    await assert.rejects(cancelledRemoteWait, /cancel remote wait/);
+    assert.equal(second.manager.listenerCount("taskTerminal"), 0);
+    assert.equal(second.manager.listenerCount("taskPersistenceError"), 0);
+    const remoteWait = second.manager.wait([fromFirst.task_id], "all");
     await assert.rejects(second.manager.send(fromFirst.session_id, "blocked"), /session_in_use/);
 
-    const remoteWait = second.manager.wait([fromFirst.task_id], "all", 3_000);
     const [firstResult, secondResult, remoteResult] = await Promise.all([
       waitTerminal(first, fromFirst.task_id),
       waitTerminal(second, fromSecond.task_id),
@@ -193,7 +205,7 @@ test("independent runtimes share records, status, waits, takeover, contention, a
     assert.match(firstResult.response ?? "", /reply:first/);
     assert.match(secondResult.response ?? "", /reply:second/);
     assert.equal(remoteResult.completed[0]?.task_id, fromFirst.task_id);
-    const repeatLast = await second.manager.wait([fromFirst.task_id], "all", 0);
+    const repeatLast = await second.manager.wait([fromFirst.task_id], "all");
     assert.equal(repeatLast.completed[0]?.task_id, fromFirst.task_id);
     assert.equal((await new SessionRecordStore(root).list()).length, 2);
 
@@ -204,7 +216,7 @@ test("independent runtimes share records, status, waits, takeover, contention, a
 
     const takeover = await second.manager.send(fromFirst.session_id, "after-shutdown");
     const takeoverResult = await waitTerminal(second, takeover.task_id);
-    assert.match(takeoverResult.response ?? "", /reply:first delay:80\|after-shutdown/);
+    assert.match(takeoverResult.response ?? "", /reply:first delay:300\|after-shutdown/);
     await second.manager.shutdown();
 
     const closer = await createServerRuntime(runtimeEnv(root), directory);
@@ -251,7 +263,7 @@ test("remote wait reports pending, reconciles free active records, and forgets o
   });
   const runtime = await createServerRuntime(runtimeEnv(root), directory);
   try {
-    const reconciled = await runtime.manager.wait(["task_current"], "all", 500);
+    const reconciled = await runtime.manager.wait(["task_current"], "all");
     assert.equal(reconciled.completed[0]?.status, "host_interrupted");
     const current = await store.read(sessionId);
     assert.equal(current.state, "error");
@@ -270,7 +282,7 @@ test("remote wait reports pending, reconciles free active records, and forgets o
       },
       updatedAt: now,
     });
-    await assert.rejects(runtime.manager.wait(["task_current"], "all", 0), /unknown_task/);
+    await assert.rejects(runtime.manager.wait(["task_current"], "all"), /unknown_task/);
   } finally {
     await runtime.manager.shutdown();
   }

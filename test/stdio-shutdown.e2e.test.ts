@@ -100,7 +100,7 @@ test("stdio EOF performs clean bounded shutdown of server, Pi, and tool child", 
     const spawned = JSON.parse(spawnResult.content[0]!.text) as { task_id: string };
     await request("tools/call", {
       name: "pi_wait",
-      arguments: { task_ids: [spawned.task_id], mode: "all", timeout_seconds: 1 },
+      arguments: { task_ids: [spawned.task_id], mode: "all" },
     });
 
     const stateFile = await waitFor(() =>

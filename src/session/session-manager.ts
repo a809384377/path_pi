@@ -76,7 +76,7 @@ export interface SessionManagerOptions {
 
 export interface SpawnInput { task: string; cwd: string; name?: string; model?: string }
 export interface DispatchResult { session_id: string; task_id: string; status: "running" }
-export interface WaitResult { completed: TaskResult[]; pending: string[]; timed_out: boolean }
+export interface WaitResult { completed: TaskResult[]; pending: string[] }
 export interface TaskResult {
   session_id: string;
   task_id: string;
@@ -318,29 +318,35 @@ export class SessionManager extends EventEmitter {
     }
   }
 
-  async wait(taskIds: readonly string[], mode: "any" | "all" = "any", timeoutMs = 60_000): Promise<WaitResult> {
+  async wait(
+    taskIds: readonly string[],
+    mode: "any" | "all" = "any",
+    signal?: AbortSignal,
+  ): Promise<WaitResult> {
+    throwIfAborted(signal);
     const ids = [...new Set(taskIds)];
     if (ids.length === 0) throw new Error("task_ids must not be empty");
-    if (!Number.isFinite(timeoutMs) || timeoutMs < 0) throw new Error("timeout must be a non-negative finite number");
     if (ids.every((id) => {
       const task = this.#tasks.get(id);
       return task !== undefined && this.#sessions.get(task.sessionId)?.ownership?.held === true;
     })) {
-      return this.#waitLocal(ids, mode, timeoutMs);
+      return this.#waitLocal(ids, mode, signal);
     }
     const targets = await this.#resolveWaitTargets(ids);
-    const deadline = Date.now() + timeoutMs;
+    throwIfAborted(signal);
     let observed = await this.#evaluateWait(ids, targets);
-    if (waitReady(observed, ids.length, mode)) return waitResult(observed, ids, false);
-    if (timeoutMs === 0) return waitResult(observed, ids, true);
+    throwIfAborted(signal);
+    if (waitReady(observed, ids.length, mode)) return waitResult(observed, ids);
 
-    while (Date.now() < deadline) {
-      await this.#waitForLocalEvent(Math.min(25, Math.max(1, deadline - Date.now())));
+    // Keep this MCP request open until the requested terminal condition is met. In particular,
+    // do not return a synthetic timeout: Claude Code may move this request to its own background
+    // task while it is pending, then receive the final result on this same request.
+    for (;;) {
+      await this.#waitForLocalEvent(1_000, signal);
       observed = await this.#evaluateWait(ids, targets);
-      if (waitReady(observed, ids.length, mode)) return waitResult(observed, ids, false);
+      throwIfAborted(signal);
+      if (waitReady(observed, ids.length, mode)) return waitResult(observed, ids);
     }
-    observed = await this.#evaluateWait(ids, targets);
-    return waitResult(observed, ids, true);
   }
 
   async status(sessionId: string): Promise<SessionStatus>;
@@ -925,7 +931,11 @@ export class SessionManager extends EventEmitter {
     }
   }
 
-  async #waitLocal(ids: readonly string[], mode: "any" | "all", timeoutMs: number): Promise<WaitResult> {
+  async #waitLocal(
+    ids: readonly string[],
+    mode: "any" | "all",
+    signal?: AbortSignal,
+  ): Promise<WaitResult> {
     const evaluate = (): WaitResult | undefined => {
       const tasks = ids.map((id) => this.#tasks.get(id)!);
       for (const task of tasks) {
@@ -935,14 +945,14 @@ export class SessionManager extends EventEmitter {
       const ready = mode === "all" ? completed.length === ids.length : completed.length > 0;
       if (!ready) return undefined;
       const done = new Set(completed.map((task) => task.task_id));
-      return { completed, pending: ids.filter((id) => !done.has(id)), timed_out: false };
+      return { completed, pending: ids.filter((id) => !done.has(id)) };
     };
+    throwIfAborted(signal);
     const immediate = evaluate();
     if (immediate) return immediate;
-    if (timeoutMs === 0) return { completed: [], pending: [...ids], timed_out: true };
     return new Promise<WaitResult>((resolveWait, rejectWait) => {
       const cleanup = (): void => {
-        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
         this.off("taskTerminal", onChange);
         this.off("taskPersistenceError", onChange);
       };
@@ -957,14 +967,17 @@ export class SessionManager extends EventEmitter {
           rejectWait(error);
         }
       };
-      const timer = setTimeout(() => {
+      const onAbort = (): void => {
         cleanup();
-        const completed = ids.map((id) => this.#tasks.get(id)!).filter(isPublishedTerminal).map(toTaskResult);
-        const done = new Set(completed.map((task) => task.task_id));
-        resolveWait({ completed, pending: ids.filter((id) => !done.has(id)), timed_out: true });
-      }, timeoutMs);
+        rejectWait(abortError(signal));
+      };
       this.on("taskTerminal", onChange);
       this.on("taskPersistenceError", onChange);
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
       onChange();
     });
   }
@@ -1065,20 +1078,33 @@ export class SessionManager extends EventEmitter {
     return run;
   }
 
-  #waitForLocalEvent(timeoutMs: number): Promise<void> {
-    return new Promise((resolveWait) => {
+  #waitForLocalEvent(timeoutMs: number, signal?: AbortSignal): Promise<void> {
+    throwIfAborted(signal);
+    return new Promise((resolveWait, rejectWait) => {
       let settled = false;
       const finish = (): void => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
         this.off("taskTerminal", finish);
         this.off("taskPersistenceError", finish);
         resolveWait();
       };
+      const onAbort = (): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        this.off("taskTerminal", finish);
+        this.off("taskPersistenceError", finish);
+        rejectWait(abortError(signal));
+      };
       const timer = setTimeout(finish, timeoutMs);
       this.on("taskTerminal", finish);
       this.on("taskPersistenceError", finish);
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) onAbort();
     });
   }
 
@@ -1220,14 +1246,13 @@ function waitReady(observed: ReadonlyMap<string, TaskResult | undefined>, total:
 function waitResult(
   observed: ReadonlyMap<string, TaskResult | undefined>,
   ids: readonly string[],
-  timedOut: boolean,
 ): WaitResult {
   const completed = ids.flatMap((id) => {
     const task = observed.get(id);
     return task ? [task] : [];
   });
   const done = new Set(completed.map((task) => task.task_id));
-  return { completed, pending: ids.filter((id) => !done.has(id)), timed_out: timedOut };
+  return { completed, pending: ids.filter((id) => !done.has(id)) };
 }
 
 function storedTaskResult(task: StoredTask): TaskResult {
@@ -1291,6 +1316,16 @@ async function validateCwd(cwd: string): Promise<string> {
 
 function isAssistantFailureStop(stopReason: string | undefined): boolean {
   return stopReason !== undefined && ["error", "aborted", "cancelled", "canceled"].includes(stopReason.toLowerCase());
+}
+
+function abortError(signal?: AbortSignal): Error {
+  const reason = signal?.reason;
+  if (reason instanceof Error) return reason;
+  return new Error(`wait_cancelled${reason === undefined ? "" : `: ${String(reason)}`}`);
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortError(signal);
 }
 
 function errorMessage(error: unknown): string {

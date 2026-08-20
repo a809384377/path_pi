@@ -34,7 +34,7 @@ test("MCP exposes five tools and supports spawn, wait, send, status, and close",
   await manager.initialize();
 
   const server = new McpServer({ name: "test-server", version: "0.1.0" });
-  registerTools(server, manager);
+  registerTools(server, manager, { waitHeartbeatMs: 10 });
   const client = new Client({ name: "test-client", version: "0.1.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
@@ -97,7 +97,6 @@ test("MCP exposes five tools and supports spawn, wait, send, status, and close",
           properties: {
             task_ids: { type: "array", items: { type: "string", minLength: 1 }, minItems: 1 },
             mode: { type: "string", enum: ["any", "all"], default: "any" },
-            timeout_seconds: { type: "number", minimum: 0, maximum: 300, default: 60 },
           },
           required: ["task_ids"],
           additionalProperties: false,
@@ -108,20 +107,61 @@ test("MCP exposes five tools and supports spawn, wait, send, status, and close",
   );
 
   const spawned = parseText(
-    await client.callTool({ name: "pi_spawn", arguments: { task: "mcp-first", cwd: directory, name: "mcp-worker" } }),
+    await client.callTool({ name: "pi_spawn", arguments: { task: "mcp-first delay:150", cwd: directory, name: "mcp-worker" } }),
   ) as { session_id: string; task_id: string };
+  const cancelledProgress: number[] = [];
+  const cancellation = new AbortController();
+  const cancelledWait = client.callTool(
+    { name: "pi_wait", arguments: { task_ids: [spawned.task_id], mode: "all" } },
+    undefined,
+    {
+      signal: cancellation.signal,
+      onprogress: (update) => cancelledProgress.push(update.progress),
+    },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 35));
+  assert.ok(cancelledProgress.length >= 1);
+  assert.equal(manager.listenerCount("taskTerminal"), 1);
+  cancellation.abort(new Error("cancel test wait"));
+  await assert.rejects(cancelledWait, /cancel test wait/);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(manager.listenerCount("taskTerminal"), 0);
+  assert.equal(manager.listenerCount("taskPersistenceError"), 0);
+  const cancelledProgressCount = cancelledProgress.length;
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(cancelledProgress.length, cancelledProgressCount);
+
+  const alreadyCancelled = new AbortController();
+  alreadyCancelled.abort(new Error("already cancelled wait"));
+  await assert.rejects(
+    manager.wait([spawned.task_id], "all", alreadyCancelled.signal),
+    /already cancelled wait/,
+  );
+  assert.equal(manager.listenerCount("taskTerminal"), 0);
+  assert.equal(manager.listenerCount("taskPersistenceError"), 0);
+
+  const progress: number[] = [];
   const first = parseText(
-    await client.callTool({ name: "pi_wait", arguments: { task_ids: [spawned.task_id], mode: "all", timeout_seconds: 1 } }),
+    await client.callTool(
+      { name: "pi_wait", arguments: { task_ids: [spawned.task_id], mode: "all" } },
+      undefined,
+      { onprogress: (update) => progress.push(update.progress) },
+    ),
   ) as { completed: Array<{ response: string }> };
   assert.match(first.completed[0]!.response, /mcp-first/);
+  assert.ok(progress.length >= 2);
+  assert.deepEqual(progress, progress.map((_, index) => index + 1));
+  const terminalProgressCount = progress.length;
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(progress.length, terminalProgressCount);
 
   const sent = parseText(
     await client.callTool({ name: "pi_send", arguments: { session_id: spawned.session_id, task: "mcp-second" } }),
   ) as { task_id: string };
   const second = parseText(
-    await client.callTool({ name: "pi_wait", arguments: { task_ids: [sent.task_id], mode: "all", timeout_seconds: 1 } }),
+    await client.callTool({ name: "pi_wait", arguments: { task_ids: [sent.task_id], mode: "all" } }),
   ) as { completed: Array<{ response: string }> };
-  assert.match(second.completed[0]!.response, /mcp-first\|mcp-second/);
+  assert.match(second.completed[0]!.response, /mcp-first.*\|mcp-second/);
 
   const status = parseText(
     await client.callTool({ name: "pi_status", arguments: { session_id: spawned.session_id } }),

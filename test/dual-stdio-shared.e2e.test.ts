@@ -123,9 +123,9 @@ test("two independent stdio servers share registry and transfer after graceful s
     assert.deepEqual(contention.value, { error: "session_in_use" });
 
     const [firstWait, secondWait, remoteWait] = await Promise.all([
-      first.tool("pi_wait", { task_ids: [firstSession.task_id], mode: "all", timeout_seconds: 3 }),
-      second.tool("pi_wait", { task_ids: [secondSession.task_id], mode: "all", timeout_seconds: 3 }),
-      second.tool("pi_wait", { task_ids: [firstSession.task_id], mode: "all", timeout_seconds: 3 }),
+      first.tool("pi_wait", { task_ids: [firstSession.task_id], mode: "all" }),
+      second.tool("pi_wait", { task_ids: [secondSession.task_id], mode: "all" }),
+      second.tool("pi_wait", { task_ids: [firstSession.task_id], mode: "all" }),
     ]);
     assert.match(firstWait.value.completed[0].response, /stdio-first/);
     assert.match(secondWait.value.completed[0].response, /stdio-second/);
@@ -138,7 +138,6 @@ test("two independent stdio servers share registry and transfer after graceful s
     const takeoverWait = await second.tool("pi_wait", {
       task_ids: [takeover.value.task_id],
       mode: "all",
-      timeout_seconds: 3,
     });
     assert.match(takeoverWait.value.completed[0].response, /stdio-first delay:100\|stdio-takeover/);
     const closed = await second.tool("pi_close", { session_id: firstSession.session_id });
