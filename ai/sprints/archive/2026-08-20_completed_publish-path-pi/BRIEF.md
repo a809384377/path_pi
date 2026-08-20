@@ -10,7 +10,7 @@
 - [x] 仓库包含可安装的 pi-agent Skill、MCP 源码和中文安装文档
 - [x] 配置样例不含真实密钥或本机私有配置
 - [x] 构建、测试与打包检查通过
-- [ ] GitHub 公共仓库 a809384377/path_pi 创建并可访问
+- [x] GitHub 公共仓库 a809384377/path_pi 创建并可访问
 
 ## 范围
 - 包含: README、安装文档、Skill、Pi 配置样例、package manifest、现有 MCP 源码与测试、GitHub 发布

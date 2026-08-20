@@ -1,6 +1,6 @@
 # 日志
 
-## 状态: active
+## 状态: completed
 
 ---
 
@@ -33,3 +33,22 @@
 
 - 无超时长请求不能只删除 timeout；必须把协议层取消信号贯穿到内部等待，并在所有路径释放定时器和监听器。
 - 首次公开本地仓库时，内容扫描之外还要检查 Git author/committer 元数据，避免永久公开个人邮箱。
+
+---
+
+## Sprint 总结
+
+### 状态: completed
+### 周期: 2026-08-20 -> 2026-08-20
+
+### 目标与结果
+| 成功标准 | 结果 |
+|---------|------|
+| 仓库包含可安装的 pi-agent Skill、MCP 源码和中文安装文档 | pass |
+| 配置样例不含真实密钥或本机私有配置 | pass |
+| 构建、测试与打包检查通过 | pass — typecheck、120 tests、pack dry-run、安装脚本模拟通过 |
+| GitHub 公共仓库创建并可访问 | pass — https://github.com/a809384377/path_pi |
+
+### 后续注意事项
+- MCP Client 取消 `pi_wait` 只终止本次观察等待，不取消底层 Pi 任务。
+- `scripts/install.sh --force` 只替换 Skill 符号链接，遇到真实文件或目录会拒绝执行。
