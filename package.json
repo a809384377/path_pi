@@ -1,5 +1,5 @@
 {
-  "name": "@a809384377/pi-agent-mcp",
+  "name": "@pathli/pi-agent-mcp",
   "version": "0.1.0",
   "description": "Run persistent local Pi coding-agent sessions from Claude Code, Codex, and other MCP hosts",
   "type": "module",

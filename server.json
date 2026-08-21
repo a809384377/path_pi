@@ -14,7 +14,7 @@
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
-      "identifier": "@a809384377/pi-agent-mcp",
+      "identifier": "@pathli/pi-agent-mcp",
       "version": "0.1.0",
       "runtimeHint": "npx",
       "runtimeArguments": [

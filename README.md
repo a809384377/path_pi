@@ -1,6 +1,6 @@
 # Pi Agent MCP
 
-[![npm](https://img.shields.io/npm/v/@a809384377/pi-agent-mcp)](https://www.npmjs.com/package/@a809384377/pi-agent-mcp)
+[![npm](https://img.shields.io/npm/v/@pathli/pi-agent-mcp)](https://www.npmjs.com/package/@pathli/pi-agent-mcp)
 [![CI](https://github.com/a809384377/path_pi/actions/workflows/ci.yml/badge.svg)](https://github.com/a809384377/path_pi/actions/workflows/ci.yml)
 
 A local stdio MCP server that lets Claude Code, Codex, and other MCP hosts run multiple persistent [Pi Coding Agent](https://github.com/badlogic/pi-mono) sessions.
@@ -27,7 +27,7 @@ pi
 Install the MCP server globally:
 
 ```sh
-npm install -g @a809384377/pi-agent-mcp@0.1.0
+npm install -g @pathli/pi-agent-mcp@0.1.0
 command -v pi-agent-mcp
 command -v pi
 ```
@@ -57,7 +57,7 @@ These Host commands may reject or replace an existing `pi-agent` registration ac
 The Skill is optional. Locate the global npm package and copy its static file explicitly:
 
 ```sh
-PACKAGE_ROOT="$(npm root -g)/@a809384377/pi-agent-mcp"
+PACKAGE_ROOT="$(npm root -g)/@pathli/pi-agent-mcp"
 ```
 
 For Claude Code, install only when no file already exists:
@@ -91,8 +91,8 @@ The commands preserve existing Skill files. Compare an existing file with the pa
 Update the npm package first:
 
 ```sh
-npm install -g @a809384377/pi-agent-mcp@latest
-PACKAGE_ROOT="$(npm root -g)/@a809384377/pi-agent-mcp"
+npm install -g @pathli/pi-agent-mcp@latest
+PACKAGE_ROOT="$(npm root -g)/@pathli/pi-agent-mcp"
 ```
 
 If you previously installed a Skill, review the packaged changes before replacing it. For Claude Code:
@@ -137,7 +137,7 @@ Remove Host registrations explicitly. Then remove a Skill only when it is byte-f
 claude mcp remove pi-agent --scope user
 codex mcp remove pi-agent
 
-PACKAGE_ROOT="$(npm root -g)/@a809384377/pi-agent-mcp"
+PACKAGE_ROOT="$(npm root -g)/@pathli/pi-agent-mcp"
 for SKILL_FILE in \
   "$HOME/.claude/skills/pi-agent/SKILL.md" \
   "$HOME/.agents/skills/pi-agent/SKILL.md"
@@ -150,7 +150,7 @@ do
   fi
 done
 
-npm uninstall -g @a809384377/pi-agent-mcp
+npm uninstall -g @pathli/pi-agent-mcp
 ```
 
 Run only the Host removal commands you actually configured. The Skill loop preserves modified files and any other files in the Skill directory. These commands intentionally preserve `~/.pi/agent-mcp`, Pi authentication, and native Pi sessions. To remove state, first stop every MCP Host and Pi worker, back up anything needed, and delete the state directory yourself.
@@ -178,7 +178,7 @@ Install globally when possible because the package uses a prebuilt native owners
 ```json
 {
   "command": "npx",
-  "args": ["-y", "@a809384377/pi-agent-mcp@0.1.0"]
+  "args": ["-y", "@pathli/pi-agent-mcp@0.1.0"]
 }
 ```
 
