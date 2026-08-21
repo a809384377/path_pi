@@ -1,0 +1,31 @@
+{
+  "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/registry/main/docs/reference/server-json/draft/server.schema.json",
+  "name": "io.github.a809384377/pi-agent-mcp",
+  "title": "Pi Agent MCP",
+  "description": "Run persistent local Pi coding-agent sessions from MCP hosts",
+  "version": "0.1.0",
+  "websiteUrl": "https://github.com/a809384377/path_pi",
+  "repository": {
+    "url": "https://github.com/a809384377/path_pi",
+    "source": "github",
+    "id": "1340450591"
+  },
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@a809384377/pi-agent-mcp",
+      "version": "0.1.0",
+      "runtimeHint": "npx",
+      "runtimeArguments": [
+        {
+          "type": "named",
+          "name": "-y"
+        }
+      ],
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

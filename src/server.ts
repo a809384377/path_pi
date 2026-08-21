@@ -15,6 +15,7 @@ import {
   discoverLegacySources,
   type MigrationOutcome,
 } from "./store/v1-migration.js";
+import { PACKAGE_VERSION } from "./version.js";
 
 export interface ServerRuntime {
   server: McpServer;
@@ -84,7 +85,7 @@ export async function createServerRuntime(
   });
   await manager.initialize();
 
-  const server = new McpServer({ name: "pi-agent-mcp", version: "0.1.0" });
+  const server = new McpServer({ name: "pi-agent-mcp", version: PACKAGE_VERSION });
   registerTools(server, manager);
   return { server, manager, stateRoot: configuration.stateRoot, migrationOutcomes };
 }

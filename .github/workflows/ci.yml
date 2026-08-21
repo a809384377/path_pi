@@ -25,4 +25,21 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
-      - run: npm pack --dry-run
+      - name: Validate MCP Registry metadata
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/modelcontextprotocol/registry/main/docs/reference/server-json/draft/server.schema.json -o "$RUNNER_TEMP/mcp-server-schema.json"
+          npx --yes ajv-cli@5 validate -s "$RUNNER_TEMP/mcp-server-schema.json" -d server.json --strict=false
+      - name: Install and smoke packaged artifact
+        shell: bash
+        run: |
+          npm pack --json > "$RUNNER_TEMP/pack.json"
+          TARBALL=$(node -p "JSON.parse(require('fs').readFileSync(process.argv[1], 'utf8'))[0].filename" "$RUNNER_TEMP/pack.json")
+          PREFIX="$RUNNER_TEMP/package-prefix"
+          npm install -g --prefix "$PREFIX" "./$TARBALL"
+          set +e
+          "$PREFIX/bin/pi-agent-mcp" --version > "$RUNNER_TEMP/arg.out" 2> "$RUNNER_TEMP/arg.err"
+          STATUS=$?
+          set -e
+          test "$STATUS" -eq 2
+          grep -q "does not accept command-line arguments" "$RUNNER_TEMP/arg.err"
+          node test/fixtures/package-smoke.mjs "$PREFIX/bin/pi-agent-mcp" "$GITHUB_WORKSPACE/test/fixtures/fake-pi.mjs"

@@ -17,6 +17,10 @@ export async function flockExclusiveNonblocking(fd: number): Promise<void> {
   });
 }
 
+export function verifyOwnershipSupport(): void {
+  loadBinding();
+}
+
 function loadBinding(): FlockBinding {
   if (loaded) return loaded;
   if (loadError) throw ownershipLoadError(loadError);

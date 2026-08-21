@@ -1,245 +1,236 @@
-# path_pi
+# Pi Agent MCP
 
-我的公开 Pi 配置、Agent Skills 与集成工具集。目前仓库的核心是 `pi-agent-mcp`：Claude Code、Codex 等 MCP Host 可以把独立任务派给多个持久、可继续复用上下文的 [Pi](https://github.com/badlogic/pi-mono) session。
+[![npm](https://img.shields.io/npm/v/@a809384377/pi-agent-mcp)](https://www.npmjs.com/package/@a809384377/pi-agent-mcp)
+[![CI](https://github.com/a809384377/path_pi/actions/workflows/ci.yml/badge.svg)](https://github.com/a809384377/path_pi/actions/workflows/ci.yml)
 
-## 仓库内容
+A local stdio MCP server that lets Claude Code, Codex, and other MCP hosts run multiple persistent [Pi Coding Agent](https://github.com/badlogic/pi-mono) sessions.
 
-```text
-skills/pi-agent/       # Claude Code/Codex 调用 MCP 的 Agent Skill
-src/                   # pi-agent-mcp TypeScript 源码
-scripts/install.sh     # 构建并配置 Skill + MCP Host
-examples/              # 不含真实凭据的 Pi 配置样例
-docs/INSTALL.zh-CN.md  # 中文安装、认证、升级与卸载指南
-```
-
-## 快速安装
-
-```sh
-git clone https://github.com/a809384377/path_pi.git
-cd path_pi
-./scripts/install.sh             # 自动配置检测到的 Claude Code/Codex
-# 或：./scripts/install.sh --host claude|codex|all
-```
-
-要求 Node.js `>=22.19 <26`、Pi `0.84.1` 或兼容版本，以及至少一个已认证的 Pi 模型。完整步骤见 **[中文安装与认证指南](docs/INSTALL.zh-CN.md)**。
-
-> 仓库只提供脱敏样例，不包含本机 `auth.json`、真实 `models.json`、API key、GitHub token 或 Pi session。不要将这些私有文件复制进公开仓库。
-
-## pi-agent-mcp
-
-`pi-agent-mcp` exposes reusable Pi coding-agent sessions to Claude Code, Codex, and other MCP clients.
-
-Claude Code, Codex, and other local MCP hosts share one registry by default at `~/.pi/agent-mcp/`. Each logical session has an independent durable record and kernel-backed logical/native ownership locks, so different MCP servers can work on different sessions concurrently without overwriting registry state.
-
-Each resident session owns one `pi --mode rpc` process. When a task settles, Pi stays idle and retains both ownership locks, preserving its conversation for the next `pi_send`. There is intentionally no online handoff of an idle resident session: another MCP host receives `session_in_use` until the owner shuts down gracefully.
+The npm package contains the MCP server and `skills/pi-agent/SKILL.md`. It does **not** include Pi, model credentials, or a configuration manager. Installation never modifies MCP Host settings or user Skill directories.
 
 ## Requirements
 
-- macOS or Linux, x64 or arm64; Windows and network filesystems are not supported
+- Pi Coding Agent `>=0.84.1 <0.85.0`, installed and authenticated
 - Node.js `>=22.19 <26`
-- `pi` installed and available on `PATH` (the v2 protocol targets Pi 0.84.1 or compatible behavior)
-- A configured Pi model/provider
+- macOS or Linux on x64 or arm64
+- A local filesystem for `~/.pi/agent-mcp`; network filesystems are unsupported
 
-Ownership uses the pinned `fs-ext-extra-prebuilt@2.2.12` kernel `flock` binding. If the binding cannot load on the supported matrix, startup or the tool call fails closed with `ownership_unavailable`; there is no PID/lease fallback.
-
-## Install and build
+Verify Pi before installing:
 
 ```sh
-npm install
-npm run build
+pi --version
+pi
+# Run /login if Pi has no authenticated model provider.
 ```
 
-The MCP entry point is `dist/src/index.js`. The server uses stdio: stdout is reserved for MCP messages and diagnostics go to stderr.
+## Install
 
-## Configure Claude Code
+Install the MCP server globally:
 
-Register the built server with an absolute path. Do not set a caller-specific state directory for normal shared use:
+```sh
+npm install -g @a809384377/pi-agent-mcp@0.1.0
+command -v pi-agent-mcp
+command -v pi
+```
+
+Register it explicitly with each MCP Host you want to use. Replace `/absolute/path/to/pi` with the result of `command -v pi`.
+
+### Claude Code
 
 ```sh
 claude mcp add --scope user --transport stdio \
-  --env "PI_AGENT_MCP_PI_EXECUTABLE=$(command -v pi)" \
-  pi-agent -- "$(command -v node)" "/absolute/path/to/path_pi/dist/src/index.js"
+  --env PI_AGENT_MCP_PI_EXECUTABLE=/absolute/path/to/pi \
+  pi-agent -- pi-agent-mcp
 ```
 
-## Configure Codex
+### Codex
 
-Add the same server to `~/.codex/config.toml`, also without a state-directory override:
-
-```toml
-[mcp_servers.pi_agent]
-command = "/absolute/path/to/node"
-args = ["/absolute/path/to/path_pi/dist/src/index.js"]
-
-[mcp_servers.pi_agent.env]
-PI_AGENT_MCP_PI_EXECUTABLE = "/absolute/path/to/pi"
+```sh
+codex mcp add \
+  --env PI_AGENT_MCP_PI_EXECUTABLE=/absolute/path/to/pi \
+  pi-agent -- pi-agent-mcp
 ```
 
-Both clients now discover the same sessions through `~/.pi/agent-mcp/`. They may run tasks on different sessions in parallel. Only one MCP server may own a particular logical or native Pi session at a time.
+These Host commands may reject or replace an existing `pi-agent` registration according to the Host's own behavior. Review any existing registration before running them.
 
-### Optional isolation
+## Install the Skill
 
-`PI_AGENT_MCP_STATE_DIR=/absolute/private/path` creates an intentionally isolated registry for tests or advanced setups. Arbitrary explicit roots never import or consolidate the canonical or legacy roots. The known old roots `~/.pi/agent-mcp-claude` and `~/.pi/agent-mcp-codex` are rejected with upgrade guidance so a stale client configuration cannot silently recreate split lock namespaces. Do not give two long-lived clients different overrides when you expect them to share sessions.
+The Skill is optional. Locate the global npm package and copy its static file explicitly:
 
-## Upgrade from separate v1 roots
+```sh
+PACKAGE_ROOT="$(npm root -g)/@a809384377/pi-agent-mcp"
+```
 
-Older configurations commonly used `~/.pi/agent-mcp-claude/` and `~/.pi/agent-mcp-codex/`. Upgrade in this order:
+For Claude Code, install only when no file already exists:
 
-1. Stop every old Claude Code/Codex MCP client and confirm their Pi RPC processes have exited.
-2. Remove `PI_AGENT_MCP_STATE_DIR` from both client configurations.
-3. Start one v2 client. It first resumes incomplete migration transactions, then imports `sessions.json` from the canonical, Claude, Codex, and configured legacy roots into `~/.pi/agent-mcp/`.
-4. Check `pi_status` and completed receipts under `~/.pi/agent-mcp/migrations/*/receipt.json`. New migrations retire legacy manifests as deterministic `sessions.v1.retired-<content-hash>.json` files and never delete them; transactions created by earlier v2 builds retain and resume their recorded `sessions.v1.quarantine-*` paths.
-5. Start the other v2 clients.
+```sh
+CLAUDE_SKILL="$HOME/.claude/skills/pi-agent/SKILL.md"
+if [ -e "$CLAUDE_SKILL" ]; then
+  printf 'Preserved existing Skill: %s\n' "$CLAUDE_SKILL" >&2
+else
+  mkdir -p "$(dirname "$CLAUDE_SKILL")"
+  install -m 0644 "$PACKAGE_ROOT/skills/pi-agent/SKILL.md" "$CLAUDE_SKILL"
+fi
+```
 
-Migration is source-atomic: a conflict leaves the complete source active and returns `migration_conflict`; it never partially activates that source. `PI_AGENT_MCP_LEGACY_STATE_DIRS` may provide an OS-path-delimiter-separated list of additional legacy root directories.
+For Codex, install only when no file already exists:
 
-If a v1 manifest has `cleanShutdown: false`, startup returns `legacy_state_uncertain`. After manually confirming all old MCP and Pi processes are stopped, run one canonical startup with `PI_AGENT_MCP_IMPORT_DIRTY=1`. This is a one-time human attestation, not automated stale-owner detection; active v1 tasks import as `host_interrupted`. Remove the variable after migration succeeds.
+```sh
+CODEX_SKILL="$HOME/.agents/skills/pi-agent/SKILL.md"
+if [ -e "$CODEX_SKILL" ]; then
+  printf 'Preserved existing Skill: %s\n' "$CODEX_SKILL" >&2
+else
+  mkdir -p "$(dirname "$CODEX_SKILL")"
+  install -m 0644 "$PACKAGE_ROOT/skills/pi-agent/SKILL.md" "$CODEX_SKILL"
+fi
+```
 
-## Tools
+The commands preserve existing Skill files. Compare an existing file with the packaged source and replace it only after reviewing the differences. Restart the Host after registration or Skill changes. Invoke `/pi-agent` in Claude Code, `$pi-agent` in Codex, or ask the Host to use Pi Agent.
 
-The public API remains exactly five tools; `pi_wait` intentionally no longer accepts a timeout because it waits for a terminal condition.
+## Update
 
-### `pi_spawn`
+Update the npm package first:
 
-Creates a new Pi session and starts its first task in the background:
+```sh
+npm install -g @a809384377/pi-agent-mcp@latest
+PACKAGE_ROOT="$(npm root -g)/@a809384377/pi-agent-mcp"
+```
+
+If you previously installed a Skill, review the packaged changes before replacing it. For Claude Code:
+
+```sh
+diff -u \
+  "$HOME/.claude/skills/pi-agent/SKILL.md" \
+  "$PACKAGE_ROOT/skills/pi-agent/SKILL.md" || true
+```
+
+Only after reviewing that output, explicitly replace the Claude Skill:
+
+```sh
+install -m 0644 \
+  "$PACKAGE_ROOT/skills/pi-agent/SKILL.md" \
+  "$HOME/.claude/skills/pi-agent/SKILL.md"
+```
+
+For Codex, use the same two-step review and replacement:
+
+```sh
+diff -u \
+  "$HOME/.agents/skills/pi-agent/SKILL.md" \
+  "$PACKAGE_ROOT/skills/pi-agent/SKILL.md" || true
+```
+
+Only after reviewing that output, explicitly replace the Codex Skill:
+
+```sh
+install -m 0644 \
+  "$PACKAGE_ROOT/skills/pi-agent/SKILL.md" \
+  "$HOME/.agents/skills/pi-agent/SKILL.md"
+```
+
+The npm package never rewrites Host registrations or Skill files during updates.
+
+## Uninstall
+
+Remove Host registrations explicitly. Then remove a Skill only when it is byte-for-byte identical to the file in the currently installed npm package:
+
+```sh
+claude mcp remove pi-agent --scope user
+codex mcp remove pi-agent
+
+PACKAGE_ROOT="$(npm root -g)/@a809384377/pi-agent-mcp"
+for SKILL_FILE in \
+  "$HOME/.claude/skills/pi-agent/SKILL.md" \
+  "$HOME/.agents/skills/pi-agent/SKILL.md"
+do
+  if [ -e "$SKILL_FILE" ] && cmp -s "$PACKAGE_ROOT/skills/pi-agent/SKILL.md" "$SKILL_FILE"; then
+    rm -- "$SKILL_FILE"
+    rmdir "$(dirname "$SKILL_FILE")" 2>/dev/null || true
+  elif [ -e "$SKILL_FILE" ]; then
+    printf 'Preserved modified Skill: %s\n' "$SKILL_FILE" >&2
+  fi
+done
+
+npm uninstall -g @a809384377/pi-agent-mcp
+```
+
+Run only the Host removal commands you actually configured. The Skill loop preserves modified files and any other files in the Skill directory. These commands intentionally preserve `~/.pi/agent-mcp`, Pi authentication, and native Pi sessions. To remove state, first stop every MCP Host and Pi worker, back up anything needed, and delete the state directory yourself.
+
+## Other MCP Hosts
+
+Run `pi-agent-mcp` with no arguments as a stdio MCP server. A generic configuration is:
 
 ```json
 {
-  "task": "Inspect the authentication module and fix token refresh",
-  "cwd": "/Users/me/project",
-  "name": "auth-worker",
-  "model": "anthropic/claude-sonnet-4-20250514"
+  "mcpServers": {
+    "pi-agent": {
+      "command": "pi-agent-mcp",
+      "args": [],
+      "env": {
+        "PI_AGENT_MCP_PI_EXECUTABLE": "/absolute/path/to/pi"
+      }
+    }
+  }
 }
 ```
+
+Install globally when possible because the package uses a prebuilt native ownership binding. If a Host launches it through `npx`, ensure npm lifecycle scripts are not disabled and pin a tested package version:
 
 ```json
 {
-  "session_id": "pi_...",
-  "task_id": "task_...",
-  "status": "running"
+  "command": "npx",
+  "args": ["-y", "@a809384377/pi-agent-mcp@0.1.0"]
 }
 ```
 
-`name` and `model` are optional. `cwd` must be an existing absolute directory.
+## MCP Tools
 
-### `pi_send`
+| Tool | Purpose |
+| --- | --- |
+| `pi_spawn` | Create a persistent Pi session and start its first task |
+| `pi_send` | Continue an idle or dormant session with preserved context |
+| `pi_wait` | Wait for one or all exact task IDs to reach a terminal state |
+| `pi_status` | Inspect one session or list all non-closed sessions |
+| `pi_close` | Permanently close a logical session and stop its process tree |
 
-Starts the next task on an existing idle or dormant session:
+The default shared registry is `~/.pi/agent-mcp`. Different hosts can run different sessions concurrently, but only one MCP server can own a particular logical/native Pi session at a time.
 
-```json
-{
-  "session_id": "pi_...",
-  "task": "Continue by adding regression tests"
-}
-```
+`pi_wait` has no application timeout. Cancelling the MCP request stops only that wait; it does not cancel the Pi task.
 
-The same native Pi session file is reused. A session executes one task at a time. A live owner on another MCP server returns `session_in_use`; a native alias conflict returns `native_session_in_use`. After the old owner shuts down gracefully, another server can restore and send immediately.
+## Security
 
-### `pi_wait`
+This server launches Pi with the current user's privileges. Pi can read and modify files, run commands, access inherited environment variables, and consume model-provider quota. It is not a sandbox.
 
-Waits for exact current or last task IDs:
-
-```json
-{
-  "task_ids": ["task_a", "task_b", "task_c"],
-  "mode": "any"
-}
-```
-
-- `mode: "any"` returns when at least one requested task is terminal; `pending` lists the requested tasks that are still running.
-- `mode: "all"` returns when every requested task is terminal; `pending` is empty.
-- `pi_wait` is a true terminal wait: the MCP request remains open until the requested condition is met. It has no application-level timeout and does not cancel the Pi task. If the MCP client cancels the request, only that observation wait stops; the Pi task continues. Claude Code may move the long-running request to its own background task and deliver the final result on that same request.
-- While waiting, the server sends a standard MCP progress heartbeat every 30 seconds when the client supplies a progress token. The heartbeat keeps clients from treating an otherwise silent terminal wait as idle; it does not return a tool result, trigger a new model turn, poll Pi, or change task state.
-- Local waits are event-driven. Cross-server waits re-check the durable current/last slots while the same request remains open.
-- Terminal states are `completed`, `failed`, `aborted`, and `host_interrupted`.
-- If a free active record is left by a dead host, a waiter may acquire full ownership and publish `host_interrupted` without starting Pi. If an orphan Pi still holds locks, the task remains pending.
-- Once a later task overwrites the record's last-task slot, the older ID returns `unknown_task`; there is no task-history registry.
-
-### `pi_status`
-
-With `session_id`, reads that final record from disk. With no arguments, dynamically lists all non-closed final records. Status is observational: it never acquires locks or starts Pi.
-
-Important fields:
-
-- `state`: durable state, overlaid by local runtime state only while this server holds live ownership at the same record revision
-- `resident`: `true`/`false` for a locally owned session, or `"unknown"` for another/free owner
-- `ownership`: `local`, `other`, or `free_or_unknown`; this is a diagnostic, never authorization
-- `recoverable`: whether the saved native Pi session passed strict identity validation
-- `current_task_id` and `last_task`: the durable current/last task slots
-
-A corrupt final record makes `pi_status` fail clearly instead of returning a partial list.
-
-### `pi_close`
-
-Closes a logical session permanently:
-
-```json
-{
-  "session_id": "pi_..."
-}
-```
-
-For a local resident, active work becomes `aborted`, the full Pi process group is stopped, and the record becomes closed. For a free remote record with native identity, close acquires both logical and native ownership, publishes any active task as `host_interrupted`, and closes without starting Pi. An identity-less error record can only be closed under logical ownership; whenever either native identity field exists, both fields and native fencing are required. A live owner returns `session_in_use`. The native Pi JSONL file is retained.
-
-## Errors
-
-Ownership and migration failures use stable public codes and do not expose lock paths or lock diagnostics:
-
-- `session_in_use`: another compliant host or inherited orphan owns the logical session
-- `native_session_in_use`: another logical record owns the same actual native Pi identity
-- `migration_blocked`: another migration/ownership operation currently fences the source
-- `migration_conflict`: a legacy source conflicts with existing canonical records and remains unretired
-- `legacy_state_uncertain`: dirty v1 state requires explicit post-shutdown attestation
-- `ownership_unavailable`: the kernel lock binding or secure ownership root is unavailable
-
-Other existing validation and lifecycle errors, including `unknown_session`, `unknown_task`, `session_busy`, and `session_not_recoverable`, retain their established meanings.
-
-## Persistence, crash, and orphan recovery
-
-This project implements shared logical persistence, not a daemon:
-
-- New sessions use private per-session Pi directories and preallocated native IDs.
-- Graceful shutdown stops the complete Pi process group, durably publishes `dormant`/`closed`, drains record writes, then closes ownership descriptors.
-- The next MCP server lazily restores a dormant session on `pi_send` using its exact native file and identity.
-- Tasks do not continue intentionally after host shutdown and are never replayed automatically.
-- If the MCP parent crashes while Pi survives, Pi inherits both kernel lock descriptors. Other servers fail closed with `session_in_use` until the orphan Pi process group exits.
-- To recover a permanently orphaned session, identify and terminate that Pi RPC process group, then retry `pi_wait`, `pi_send`, or `pi_close`. Never delete lock files; their contents are diagnostics only and are not stale-lock authority.
-
-The shared registry layout is:
-
-```text
-~/.pi/agent-mcp/
-  sessions/       # one atomic v2 JSON record per logical session
-  pi-sessions/    # exclusive directories for newly created native sessions
-  locks/          # stable 0600 logical/native/migration lock files
-  migrations/     # durable source snapshots, intents, conflicts, receipts
-  tmp/
-```
-
-Directories are private mode `0700`; records and lock files are mode `0600`.
-
-## Concurrency boundary
-
-Different Pi sessions may point at the same `cwd`, but this project does not create worktrees or prevent overlapping code edits. Give parallel sessions non-overlapping tasks or separate worktree directories. Kernel ownership prevents two compliant MCP servers from writing the same Pi session; it does not coordinate writes to the project checkout or protect against independent Pi TUI/third-party processes.
+- Review tasks and requested working directories before approval.
+- Do not install untrusted Skills or MCP packages.
+- Do not put API keys in MCP registration commands.
+- The package never copies `auth.json`, `models.json`, API keys, or Pi session files.
+- Shared registry permissions isolate other OS users, not other trusted MCP hosts running as the same user.
+- Report security vulnerabilities privately through [GitHub private vulnerability reporting](https://github.com/a809384377/path_pi/security/advisories/new); do not open a public issue for unpatched vulnerabilities.
+- Session ownership does not prevent different Pi sessions from editing the same checkout. Use non-overlapping tasks or separate Git worktrees.
 
 ## Configuration
 
 | Environment variable | Default | Meaning |
 | --- | --- | --- |
-| `PI_AGENT_MCP_STATE_DIR` | `~/.pi/agent-mcp` | Advanced/test override creating an isolated registry; known old Claude/Codex roots are rejected and other explicit roots never auto-consolidate |
-| `PI_AGENT_MCP_LEGACY_STATE_DIRS` | empty | Additional legacy root directories, separated by the OS path delimiter; canonical startup only |
-| `PI_AGENT_MCP_IMPORT_DIRTY` | unset | Set to `1` for one canonical startup after manually stopping all old writers |
 | `PI_AGENT_MCP_PI_EXECUTABLE` | `pi` | Pi executable path or command |
-| `PI_AGENT_MCP_MAX_SESSIONS` | `16` | Maximum active Pi processes in this MCP server |
+| `PI_AGENT_MCP_STATE_DIR` | `~/.pi/agent-mcp` | Advanced isolated registry override |
+| `PI_AGENT_MCP_LEGACY_STATE_DIRS` | empty | Additional legacy v1 roots separated by the OS path delimiter |
+| `PI_AGENT_MCP_IMPORT_DIRTY` | unset | One-time `1` migration attestation after old processes are stopped |
+| `PI_AGENT_MCP_MAX_SESSIONS` | `16` | Maximum resident Pi processes per MCP server |
 | `PI_AGENT_MCP_COMMAND_TIMEOUT_MS` | `30000` | Timeout for one Pi RPC command response |
 | `PI_AGENT_MCP_SHUTDOWN_GRACE_MS` | `1000` | Grace period before force-killing Pi |
 
 ## Development
 
 ```sh
+npm ci
 npm run typecheck
-npm run build
 npm test
 npm pack --dry-run
 ```
 
-Tests use temporary roots and a controllable fake Pi; they never read or write the user's real `~/.pi` data or call a model API. Coverage includes RPC framing, process-group cleanup, per-record atomicity, source-atomic migration, kernel ownership inheritance, cross-server status/wait/send/close behavior, and the five-tool MCP surface.
+Tests use temporary directories and a fake Pi executable. They do not read real credentials, call model APIs, or modify `~/.pi`.
+
+## License
+
+MIT
