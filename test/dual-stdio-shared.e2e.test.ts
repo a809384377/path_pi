@@ -107,7 +107,7 @@ test("two independent stdio servers share registry and transfer after graceful s
   try {
     await Promise.all([first.initialize(), second.initialize()]);
     const [firstSpawn, secondSpawn] = await Promise.all([
-      first.tool("pi_spawn", { task: "stdio-first delay:100", cwd: directory }),
+      first.tool("pi_spawn", { task: "stdio-first delay:1000", cwd: directory }),
       second.tool("pi_spawn", { task: "stdio-second delay:30", cwd: directory }),
     ]);
     assert.equal(firstSpawn.isError, false);
@@ -139,7 +139,7 @@ test("two independent stdio servers share registry and transfer after graceful s
       task_ids: [takeover.value.task_id],
       mode: "all",
     });
-    assert.match(takeoverWait.value.completed[0].response, /stdio-first delay:100\|stdio-takeover/);
+    assert.match(takeoverWait.value.completed[0].response, /stdio-first delay:1000\|stdio-takeover/);
     const closed = await second.tool("pi_close", { session_id: firstSession.session_id });
     assert.equal(closed.value.state, "closed");
     await second.close();
