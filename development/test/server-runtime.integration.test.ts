@@ -3,9 +3,9 @@ import { access, chmod, lstat, mkdir, mkdtemp, readdir, writeFile } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createServerRuntime, resolveServerConfiguration, startupErrorMessage } from "../src/server.js";
-import { SessionRecordStore, sessionRecordHash, type SessionRecordV2 } from "../src/store/session-store.js";
-import type { SessionManifest, StoredSession } from "../src/store/legacy-session-store.js";
+import { createServerRuntime, resolveServerConfiguration, startupErrorMessage } from "../../npm/src/server.js";
+import { SessionRecordStore, sessionRecordHash, type SessionRecordV2 } from "../../npm/src/store/session-store.js";
+import type { SessionManifest, StoredSession } from "../../npm/src/store/legacy-session-store.js";
 
 const fixture = join(process.cwd(), "test", "fixtures", "fake-pi.mjs");
 const now = "2026-08-18T00:00:00.000Z";

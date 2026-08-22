@@ -3,7 +3,7 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { JsonSessionStore, validateManifest, type SessionManifest } from "../src/store/session-store.js";
+import { JsonSessionStore, validateManifest, type SessionManifest } from "../../npm/src/store/session-store.js";
 
 const manifest: SessionManifest = {
   version: 1,

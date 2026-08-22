@@ -4,15 +4,15 @@ import { chmod, mkdtemp, readFile, stat, symlink, writeFile } from "node:fs/prom
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { ownershipSupportedMatrix } from "../src/ownership/flock.js";
+import { ownershipSupportedMatrix } from "../../npm/src/ownership/flock.js";
 import {
   FlockMigrationCandidateLockCoordinator,
   OwnershipLockManager,
   deduplicateAndOrderCandidates,
-} from "../src/ownership/session-ownership.js";
+} from "../../npm/src/ownership/session-ownership.js";
 
 const fixture = join(process.cwd(), "test", "fixtures", "ownership-child.mjs");
-const modulePath = join(process.cwd(), "dist", "src", "ownership", "session-ownership.js");
+const modulePath = join(process.cwd(), "..", "npm", "dist", "ownership", "session-ownership.js");
 
 function child(root: string, command: string, domain = "logical", key = "shared"): ChildProcess {
   return spawn(process.execPath, [fixture, modulePath, command, root, domain, key], {
@@ -58,7 +58,7 @@ async function acquireInChild(root: string, domain = "logical", key = "shared"):
 }
 
 test("package metadata and ownership diagnostics declare the frozen support matrix", async () => {
-  const manifest = JSON.parse(await readFile(join(process.cwd(), "package.json"), "utf8")) as {
+  const manifest = JSON.parse(await readFile(join(process.cwd(), "..", "npm", "package.json"), "utf8")) as {
     engines: { node: string };
     os: string[];
     cpu: string[];

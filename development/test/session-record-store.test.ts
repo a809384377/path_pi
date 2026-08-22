@@ -3,13 +3,13 @@ import { access, chmod, mkdir, mkdtemp, readFile, stat, symlink, writeFile } fro
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { ensurePrivateDirectory } from "../src/store/secure-fs.js";
+import { ensurePrivateDirectory } from "../../npm/src/store/secure-fs.js";
 import {
   SessionRecordStore,
   sessionRecordHash,
   validateSessionRecord,
   type SessionRecordV2,
-} from "../src/store/session-store.js";
+} from "../../npm/src/store/session-store.js";
 
 function record(sessionId: string, overrides: Partial<SessionRecordV2> = {}): SessionRecordV2 {
   return {

@@ -5,11 +5,11 @@ import { mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
-import { OwnershipLockManager, SessionOwnership } from "../src/ownership/session-ownership.js";
-import { PiRpcProcess, type PiRpcProcessOptions } from "../src/rpc/pi-rpc-process.js";
-import type { PiSessionState } from "../src/rpc/types.js";
-import { SessionManager } from "../src/session/session-manager.js";
-import { sessionRecordHash, SessionRecordStore, type SessionRecordV2 } from "../src/store/session-store.js";
+import { OwnershipLockManager, SessionOwnership } from "../../npm/src/ownership/session-ownership.js";
+import { PiRpcProcess, type PiRpcProcessOptions } from "../../npm/src/rpc/pi-rpc-process.js";
+import type { PiSessionState } from "../../npm/src/rpc/types.js";
+import { SessionManager } from "../../npm/src/session/session-manager.js";
+import { sessionRecordHash, SessionRecordStore, type SessionRecordV2 } from "../../npm/src/store/session-store.js";
 
 const fixture = join(process.cwd(), "test", "fixtures", "fake-pi.mjs");
 const now = "2026-08-18T00:00:00.000Z";
@@ -757,9 +757,9 @@ test("server SIGKILL leaves fake Pi inherited ownership until its process group 
   const hostFixture = join(process.cwd(), "test", "fixtures", "manager-host.mjs");
   const host = spawnProcess(process.execPath, [
     hostFixture,
-    join(process.cwd(), "dist", "src", "session", "session-manager.js"),
-    join(process.cwd(), "dist", "src", "store", "session-store.js"),
-    join(process.cwd(), "dist", "src", "ownership", "session-ownership.js"),
+    join(process.cwd(), "..", "npm", "dist", "session", "session-manager.js"),
+    join(process.cwd(), "..", "npm", "dist", "store", "session-store.js"),
+    join(process.cwd(), "..", "npm", "dist", "ownership", "session-ownership.js"),
     root,
     cwd,
     fixture,

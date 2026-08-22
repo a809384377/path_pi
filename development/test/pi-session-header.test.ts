@@ -6,7 +6,7 @@ import test from "node:test";
 import {
   MAX_PI_SESSION_HEADER_BYTES,
   readPiSessionIdentity,
-} from "../src/store/pi-session-header.js";
+} from "../../npm/src/store/pi-session-header.js";
 
 async function fixture(content: string | Buffer): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "pi-header-"));

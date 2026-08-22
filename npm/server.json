@@ -3,7 +3,7 @@
   "name": "io.github.a809384377/pi-agent-mcp",
   "title": "Pi Agent MCP",
   "description": "Run persistent local Pi coding-agent sessions from MCP hosts",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "websiteUrl": "https://github.com/a809384377/path_pi",
   "repository": {
     "url": "https://github.com/a809384377/path_pi",
@@ -15,7 +15,7 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@pathli/pi-agent-mcp",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "runtimeHint": "npx",
       "runtimeArguments": [
         {

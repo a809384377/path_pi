@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import test from "node:test";
-import { PiRpcProcess, type SpawnedProcess } from "../src/rpc/pi-rpc-process.js";
+import { PiRpcProcess, type SpawnedProcess } from "../../npm/src/rpc/pi-rpc-process.js";
 
 class FakeChild extends EventEmitter implements SpawnedProcess {
   readonly stdin = new PassThrough();

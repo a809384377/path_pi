@@ -4,8 +4,8 @@ import { mkdtemp, readFile, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { JsonlDecoder } from "../src/rpc/jsonl.js";
-import { SessionRecordStore } from "../src/store/session-store.js";
+import { JsonlDecoder } from "../../npm/src/rpc/jsonl.js";
+import { SessionRecordStore } from "../../npm/src/store/session-store.js";
 
 interface JsonRpcResponse {
   id?: number;
@@ -52,7 +52,7 @@ test("stdio EOF performs clean bounded shutdown of server, Pi, and tool child", 
   const directory = await mkdtemp(join(tmpdir(), "pi-agent-stdio-"));
   const stateDirectory = join(directory, "state");
   const fixture = join(process.cwd(), "test", "fixtures", "fake-pi.mjs");
-  const server = spawn(process.execPath, [join(process.cwd(), "dist", "src", "index.js")], {
+  const server = spawn(process.execPath, [join(process.cwd(), "..", "npm", "dist", "index.js")], {
     cwd: process.cwd(),
     env: {
       ...process.env,

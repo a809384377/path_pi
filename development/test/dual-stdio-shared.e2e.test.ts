@@ -4,8 +4,8 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { JsonlDecoder } from "../src/rpc/jsonl.js";
-import { SessionRecordStore } from "../src/store/session-store.js";
+import { JsonlDecoder } from "../../npm/src/rpc/jsonl.js";
+import { SessionRecordStore } from "../../npm/src/store/session-store.js";
 
 interface JsonRpcResponse {
   id?: number;
@@ -21,7 +21,7 @@ class StdioHost {
   stderr = "";
 
   constructor(root: string, cwd: string, fixture: string) {
-    this.process = spawn(process.execPath, [join(process.cwd(), "dist", "src", "index.js")], {
+    this.process = spawn(process.execPath, [join(process.cwd(), "..", "npm", "dist", "index.js")], {
       cwd: process.cwd(),
       env: {
         ...process.env,

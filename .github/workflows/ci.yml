@@ -21,17 +21,24 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
-          cache: npm
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npm test
+      - name: Install package dependencies
+        run: npm ci --prefix npm
+      - name: Install development dependencies
+        run: npm ci --prefix development
+      - name: Typecheck package
+        run: npm run typecheck --prefix npm
+      - name: Typecheck development tests
+        run: npm run typecheck --prefix development
+      - name: Run tests
+        run: npm test --prefix development
       - name: Validate MCP Registry metadata
         run: |
           curl -fsSL https://raw.githubusercontent.com/modelcontextprotocol/registry/main/docs/reference/server-json/draft/server.schema.json -o "$RUNNER_TEMP/mcp-server-schema.json"
-          npx --yes ajv-cli@5 validate -s "$RUNNER_TEMP/mcp-server-schema.json" -d server.json --strict=false
+          npx --yes ajv-cli@5 validate -s "$RUNNER_TEMP/mcp-server-schema.json" -d npm/server.json --strict=false
       - name: Install and smoke packaged artifact
         shell: bash
         run: |
+          cd npm
           npm pack --json > "$RUNNER_TEMP/pack.json"
           TARBALL=$(node -p "JSON.parse(require('fs').readFileSync(process.argv[1], 'utf8'))[0].filename" "$RUNNER_TEMP/pack.json")
           PREFIX="$RUNNER_TEMP/package-prefix"
@@ -42,4 +49,4 @@ jobs:
           set -e
           test "$STATUS" -eq 2
           grep -q "does not accept command-line arguments" "$RUNNER_TEMP/arg.err"
-          node test/fixtures/package-smoke.mjs "$PREFIX/bin/pi-agent-mcp" "$GITHUB_WORKSPACE/test/fixtures/fake-pi.mjs"
+          node ../development/test/fixtures/package-smoke.mjs "$PREFIX/bin/pi-agent-mcp" "$GITHUB_WORKSPACE/development/test/fixtures/fake-pi.mjs"

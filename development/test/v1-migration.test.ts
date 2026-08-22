@@ -4,8 +4,8 @@ import { access, chmod, lstat, mkdir, mkdtemp, readFile, readdir, rename, symlin
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import test from "node:test";
-import { SessionRecordStore, type SessionRecordV2 } from "../src/store/session-store.js";
-import type { SessionManifest, StoredSession } from "../src/store/legacy-session-store.js";
+import { SessionRecordStore, type SessionRecordV2 } from "../../npm/src/store/session-store.js";
+import type { SessionManifest, StoredSession } from "../../npm/src/store/legacy-session-store.js";
 import {
   InProcessMigrationCandidateLockCoordinator,
   V1SessionMigrator,
@@ -16,7 +16,7 @@ import {
   orderedMigrationCandidates,
   type MigrationCandidate,
   type MigrationCandidateLockCoordinator,
-} from "../src/store/v1-migration.js";
+} from "../../npm/src/store/v1-migration.js";
 
 const now = "2026-08-18T00:00:00.000Z";
 

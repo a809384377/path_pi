@@ -1,5 +1,8 @@
 node_modules/
-dist/
+npm/node_modules/
+npm/dist/
+development/node_modules/
+development/dist/
 coverage/
 *.log
 .env
@@ -9,6 +12,7 @@ ai/cache/
 .playwright-mcp/
 .pi/subagents/
 .pi/agent-mcp/
+.local-backups/
 .DS_Store
 
 # Never publish local credentials or private keys.

@@ -3,13 +3,13 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { registerTools } from "../src/server.js";
-import { OwnershipLockManager } from "../src/ownership/session-ownership.js";
-import { SessionManager } from "../src/session/session-manager.js";
-import { SessionRecordStore } from "../src/store/session-store.js";
+import { Client } from "../../npm/node_modules/@modelcontextprotocol/sdk/dist/esm/client/index.js";
+import { InMemoryTransport } from "../../npm/node_modules/@modelcontextprotocol/sdk/dist/esm/inMemory.js";
+import { McpServer } from "../../npm/node_modules/@modelcontextprotocol/sdk/dist/esm/server/mcp.js";
+import { registerTools } from "../../npm/src/server.js";
+import { OwnershipLockManager } from "../../npm/src/ownership/session-ownership.js";
+import { SessionManager } from "../../npm/src/session/session-manager.js";
+import { SessionRecordStore } from "../../npm/src/store/session-store.js";
 
 const fixture = join(process.cwd(), "test", "fixtures", "fake-pi.mjs");
 

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { JsonlDecoder } from "../src/rpc/jsonl.js";
+import { JsonlDecoder } from "../../npm/src/rpc/jsonl.js";
 
 test("JsonlDecoder handles fragmented UTF-8, multiple frames, CRLF, and embedded Unicode separators", () => {
   const decoder = new JsonlDecoder();
